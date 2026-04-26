@@ -1,3 +1,12 @@
+import {
+  buildAcceptForKind,
+  buildRefererAndOrigin,
+  buildSecFetchHeaders,
+  inferResourceKind,
+  pickAcceptLanguage,
+  pickUserAgentForUpstream,
+  DEFAULT_ACCEPT_ENCODING,
+} from "./browserHeaders";
 import { cookieHeaderForHost } from "./cookieJar";
 
 const HOP_BY_HOP = new Set([
@@ -13,41 +22,82 @@ const HOP_BY_HOP = new Set([
   "content-length",
   "expect",
   "max-forwards",
-  // do not pass browser's Cookie to target — we use jar instead
   "cookie",
   "authorization",
 ]);
 
-const DEFAULT_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+/** Replaced with browser-like values so the upstream sees a real client, not a generic bot. */
+const INCOMING_STRIP = new Set([
+  "user-agent",
+  "accept",
+  "accept-language",
+  "accept-encoding",
+  "referer",
+  "origin",
+  "sec-fetch-dest",
+  "sec-fetch-mode",
+  "sec-fetch-site",
+  "sec-fetch-user",
+  "sec-fetch-dest-fragment",
+  "sec-ch-ua",
+  "sec-ch-ua-mobile",
+  "sec-ch-ua-platform",
+  "downlink",
+  "dpr",
+  "save-data",
+  "viewport-width",
+  "width",
+  "device-memory",
+  "rtt",
+  "ect",
+  "priority",
+  ...HOP_BY_HOP,
+]);
+
+export type UpstreamRequestOptions = {
+  sessionId: string;
+  jarHost: string;
+  /** From `&ref=` — page URL to send as `Referer` / `Origin` for cross-origin CDN requests */
+  documentReferer?: string | null;
+};
 
 /**
- * Build headers for upstream fetch. Merges replay cookies from the session jar.
+ * Build headers for upstream fetch. Uses a **rotated** Chrome-like User-Agent,
+ * `Accept*`, `Sec-Fetch-*`, and `Referer`/`Origin` derived from the target URL
+ * and optional `documentReferer` (mirrors a browser subresource or navigation).
  */
 export function buildUpstreamRequestHeaders(
   incoming: Headers,
   target: URL,
-  options: { sessionId: string; jarHost: string },
+  options: UpstreamRequestOptions,
 ): Headers {
   const out = new Headers();
+  const ref = options.documentReferer ?? null;
+  const kind = inferResourceKind(target);
 
   incoming.forEach((value, key) => {
     const l = key.toLowerCase();
-    if (HOP_BY_HOP.has(l)) return;
+    if (INCOMING_STRIP.has(l)) return;
     if (l === "cookie" || l === "authorization") return;
     out.set(key, value);
   });
 
-  if (!out.get("user-agent")) out.set("user-agent", DEFAULT_UA);
-  if (!out.get("accept-language")) out.set("accept-language", "en-US,en;q=0.9");
-  if (!out.get("accept")) {
-    out.set(
-      "accept",
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    );
-  }
-  if (!out.get("accept-encoding")) {
-    out.set("accept-encoding", "br, gzip, deflate");
+  out.set("user-agent", pickUserAgentForUpstream());
+  out.set("accept", buildAcceptForKind(kind));
+  out.set("accept-language", pickAcceptLanguage());
+  out.set("accept-encoding", DEFAULT_ACCEPT_ENCODING);
+
+  const { referer, origin } = buildRefererAndOrigin(target, ref);
+  out.set("referer", referer);
+  out.set("origin", origin);
+
+  const sec = buildSecFetchHeaders(target, kind, ref);
+  out.set("sec-fetch-dest", sec["sec-fetch-dest"]);
+  out.set("sec-fetch-mode", sec["sec-fetch-mode"]);
+  out.set("sec-fetch-site", sec["sec-fetch-site"]);
+  out.set("sec-fetch-user", sec["sec-fetch-user"]);
+  if (target.protocol === "https:") {
+    out.set("upgrade-insecure-requests", "1");
   }
 
   const jar = cookieHeaderForHost(options.sessionId, options.jarHost);
@@ -55,8 +105,6 @@ export function buildUpstreamRequestHeaders(
     out.set("cookie", jar);
   }
 
-  out.set("referer", `${target.origin}/`);
-  out.set("origin", target.origin);
   out.set("cache-control", "no-cache");
   return out;
 }
@@ -68,9 +116,9 @@ const NOT_FOR_PUPPETEER_EXTRA = new Set([
   "content-length",
   "referer",
   "origin",
-  "accept-encoding", // set by the browser; avoids mismatch
-  "user-agent", // set via page.setUserAgent
-  "sec-fetch-dest", // can break navigation; browser sets
+  "accept-encoding",
+  "user-agent",
+  "sec-fetch-dest",
   "sec-fetch-mode",
   "sec-fetch-site",
   "sec-fetch-user",
@@ -80,9 +128,12 @@ const NOT_FOR_PUPPETEER_EXTRA = new Set([
   "te",
   "expect",
   "date",
-  "dnt", // may be disallowed; skip if needed
+  "dnt",
   "alt-used",
   "http2-settings",
+  "sec-ch-ua",
+  "sec-ch-ua-mobile",
+  "sec-ch-ua-platform",
 ]);
 
 function recordHasHeader(o: Record<string, string>, lname: string): boolean {
@@ -103,9 +154,7 @@ export function headersToForwardForPuppeteer(h: Headers): Record<string, string>
     o[key] = value;
   });
   if (!recordHasHeader(o, "accept")) {
-    o["Accept"] =
-      h.get("accept") ||
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
+    o["Accept"] = h.get("accept") || "";
   }
   if (!recordHasHeader(o, "accept-language")) {
     o["Accept-Language"] = h.get("accept-language") || "en-US,en;q=0.9";

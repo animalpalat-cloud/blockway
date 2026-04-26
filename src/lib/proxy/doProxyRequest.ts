@@ -8,6 +8,7 @@ import {
 import { rewriteHtml } from "./rewriteHtml";
 import { rewriteCss } from "./rewriteCss";
 import { renderWithPuppeteer } from "./puppeteerRender";
+import { safeDocumentRefererParam } from "./browserHeaders";
 import { STRIP_FROM_RESPONSE, buildUpstreamRequestHeaders } from "./upstreamHeaders";
 import { isBlockedTarget, normalizeUrl, SESSION_COOKIE } from "./urls";
 import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
@@ -79,6 +80,9 @@ export async function doProxy(
   }
 
   const jarHost = parsed.hostname;
+  const documentReferer = safeDocumentRefererParam(
+    request.nextUrl.searchParams.get("ref"),
+  );
   const maxBytes = MAX_SIZE_MB * 1024 * 1024;
 
   if (method === "GET" && shouldRenderHtmlWithPuppeteer(request, parsed)) {
@@ -88,6 +92,7 @@ export async function doProxy(
         request.headers,
         sessionId,
         jarHost,
+        documentReferer,
       );
       absorbPuppeteerCookies(sessionId, r.cookies);
       const out = Buffer.from(rewriteHtml(r.html, r.finalUrl, true), "utf-8");
@@ -113,7 +118,7 @@ export async function doProxy(
   const headers = buildUpstreamRequestHeaders(
     request.headers,
     parsed,
-    { sessionId, jarHost },
+    { sessionId, jarHost, documentReferer },
   );
 
   try {

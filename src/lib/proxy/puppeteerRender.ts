@@ -74,9 +74,10 @@ export function renderWithPuppeteer(
   requestHeaders: Headers,
   sessionId: string,
   jarHost: string,
+  documentReferer?: string | null,
 ): Promise<PuppeteerRenderResult> {
   return withRenderLock(() =>
-    doRenderWithPuppeteer(target, requestHeaders, sessionId, jarHost),
+    doRenderWithPuppeteer(target, requestHeaders, sessionId, jarHost, documentReferer),
   );
 }
 
@@ -85,11 +86,12 @@ async function doRenderWithPuppeteer(
   requestHeaders: Headers,
   sessionId: string,
   jarHost: string,
+  documentReferer?: string | null,
 ): Promise<PuppeteerRenderResult> {
   const upstreamH = buildUpstreamRequestHeaders(
     requestHeaders,
     target,
-    { sessionId, jarHost },
+    { sessionId, jarHost, documentReferer },
   );
   const extra = headersToForwardForPuppeteer(upstreamH);
 

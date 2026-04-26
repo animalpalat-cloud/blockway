@@ -50,7 +50,7 @@ function rewriteAttributeValue(val: string, base: string): string | null {
   if (!isLikelyUrl(val)) return null;
   const abs = absUrl(val, base);
   if (!abs) return null;
-  return proxyParamUrl(abs);
+  return proxyParamUrl(abs, base);
 }
 
 export function rewriteHtml(
@@ -135,7 +135,7 @@ export function rewriteHtml(
           const v = j.imports[k];
           if (typeof v !== "string") continue;
           const abs = absUrl(v, base) ?? new URL(v, base).toString();
-          j.imports[k] = proxyParamUrl(abs);
+          j.imports[k] = proxyParamUrl(abs, base);
         }
       }
       if (j.scopes) {
@@ -144,7 +144,7 @@ export function rewriteHtml(
             const v = sc[k];
             if (typeof v === "string") {
               const abs = absUrl(v, base) ?? new URL(v, base).toString();
-              sc[k] = proxyParamUrl(abs);
+              sc[k] = proxyParamUrl(abs, base);
             }
           }
         }
@@ -162,7 +162,7 @@ export function rewriteHtml(
     const m = c.match(/url\s*=\s*(['"]?)([^'";]+)\1/i);
     if (m?.[2]) {
       const abs = absUrl(m[2], base);
-      if (abs) $(el).attr("content", c.replace(m[0], `url=${proxyParamUrl(abs)}`));
+      if (abs) $(el).attr("content", c.replace(m[0], `url=${proxyParamUrl(abs, base)}`));
     }
   });
 

@@ -7,8 +7,19 @@ const BLOCKED_PROTOCOLS = new Set([
 export const PROXY_PATH = "/proxy";
 export const SESSION_COOKIE = "__ph_jar";
 
-export function proxyParamUrl(absolute: string): string {
-  return `${PROXY_PATH}?url=${encodeURIComponent(absolute)}`;
+/**
+ * @param documentPageUrl — current document URL, sent as `&ref=` so the proxy can send a
+ *   realistic `Referer`/`Origin` to cross-origin CDNs.
+ */
+export function proxyParamUrl(absolute: string, documentPageUrl?: string): string {
+  let u = `${PROXY_PATH}?url=${encodeURIComponent(absolute)}`;
+  if (documentPageUrl) {
+    const t = documentPageUrl.trim();
+    if (t.length > 0 && t.length <= 8_192) {
+      u += `&ref=${encodeURIComponent(t)}`;
+    }
+  }
+  return u;
 }
 
 export function normalizeUrl(input: string): URL | null {

@@ -9,7 +9,7 @@ function oneUrl(
   if (skipRewrite(t)) return m;
   const abs = absUrl(t, base);
   if (!abs) return m;
-  return `url(\"${esc(proxyParamUrl(abs))}\")`;
+  return `url(\"${esc(proxyParamUrl(abs, base))}\")`;
 }
 
 function esc(s: string): string {
@@ -45,7 +45,7 @@ export function rewriteCss(css: string, base: string): string {
       if (skipRewrite(path)) return match;
       const abs = absUrl(path, base);
       if (!abs) return match;
-      return `@import \"${esc(proxyParamUrl(abs))}\"`;
+      return `@import \"${esc(proxyParamUrl(abs, base))}\"`;
     },
   );
   return out;
