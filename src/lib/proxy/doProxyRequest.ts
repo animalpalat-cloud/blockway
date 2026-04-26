@@ -184,6 +184,9 @@ export async function doProxy(
   if (!resHeaders.get("x-proxy-render")) {
     resHeaders.set("x-proxy-render", "fetch");
   }
+  // Never forward CSP: proxied + injected assets must be allowed
+  resHeaders.delete("content-security-policy");
+  resHeaders.delete("content-security-policy-report-only");
 
   resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
   resHeaders.set("pragma", "no-cache");

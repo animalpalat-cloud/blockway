@@ -1,22 +1,23 @@
 import * as cheerio from "cheerio";
+import type { CheerioAPI } from "cheerio";
 import { buildClientRuntimePatch } from "./clientRuntime";
 import { absUrl, isLikelyUrl, proxyParamUrl, skipRewrite } from "./urls";
 import { rewriteCss, rewriteUrlCallsInString } from "./rewriteCss";
 
 // Prefer explicit first pass; then generic sweep
 const URL_ATTRS: { sel: string; attr: string }[] = [
-  { sel: "a[href]",             attr: "href" },
+  { sel: "a[href]",              attr: "href" },
   { sel: "area[href]",         attr: "href" },
   { sel: "link[href]",         attr: "href" },
-  { sel: "img[src]",           attr: "src" },
-  { sel: "img[data-src]",      attr: "data-src" },
+  { sel: "img[src]",            attr: "src" },
+  { sel: "img[data-src]",       attr: "data-src" },
   { sel: "img[data-original]",  attr: "data-original" },
-  { sel: "img[data-lazy-src]", attr: "data-lazy-src" },
+  { sel: "img[data-lazy-src]",  attr: "data-lazy-src" },
   { sel: "img[data-lazy]",     attr: "data-lazy" },
   { sel: "img[data-srcset]",   attr: "data-srcset" },
   { sel: "script[src]",         attr: "src" },
   { sel: "iframe[src]",         attr: "src" },
-  { sel: "embed[src]",          attr: "src" },
+  { sel: "embed[src]",         attr: "src" },
   { sel: "object[data]",         attr: "data" },
   { sel: "source[src]",         attr: "src" },
   { sel: "track[src]",         attr: "src" },
@@ -26,7 +27,7 @@ const URL_ATTRS: { sel: string; attr: string }[] = [
   { sel: "form[action]",       attr: "action" },
   { sel: "form[formaction]",   attr: "formaction" },
   { sel: "input[formaction]",  attr: "formaction" },
-  { sel: "button[formaction]",  attr: "formaction" },
+  { sel: "button[formaction]", attr: "formaction" },
   { sel: "use[href]",          attr: "href" },
   { sel: "image[href]",        attr: "href" },
   { sel: "source[data-src]",   attr: "data-src" },
@@ -53,36 +54,32 @@ function rewriteAttributeValue(val: string, base: string): string | null {
   return proxyParamUrl(abs, base);
 }
 
-export function rewriteHtml(
-  html: string,
-  base: string,
-  injectClientRuntime: boolean,
-): string {
-  const $ = cheerio.load(html, { xml: false });
-
-  // 0) Security / SW / CSP: strip (prevents our injected assets from being blocked)
+/** Steps 0–7: URL rewrites, CSP metas, styles, no head injection. */
+function applyCoreRewrites($: CheerioAPI, base: string): void {
   $("meta").each((_, el) => {
-    const he = String($(el).attr("http-equiv") ?? "");
-    if (/content-security-policy/i.test(he)) {
+    const he = String($(el).attr("http-equiv") ?? "").trim().toLowerCase();
+    if (he === "content-security-policy" || he === "content-security-policy-report-only") {
       $(el).remove();
       return;
     }
-    if (String($(el).attr("name") ?? "").toLowerCase() === "referrer") {
+    const nm = String($(el).attr("name") ?? "").trim().toLowerCase();
+    if (nm === "referrer" || nm === "content-security-policy" || nm === "csp") {
       $(el).remove();
+      return;
     }
   });
 
-  // Service worker + manifest: avoid cache/hijack issues
+  $(
+    'link[rel="preconnect"], link[rel=preconnect], link[rel="dns-prefetch"], link[rel=dns-prefetch], link[rel="prerender"]',
+  ).remove();
   $('link[rel="manifest"], link[rel=manifest], link[rel="serviceworker"], link[rel=serviceworker]').remove();
-  // Remove only inline SW registration; external scripts are harder
-  $('script').each((_, el) => {
+  $("script").each((_, el) => {
     const t = String($(el).html() || "");
     if (/\bnavigator\.serviceWorker\.register\b/.test(t)) {
       $(el).remove();
     }
   });
 
-  // 1) Explicit selectors
   for (const { sel, attr } of URL_ATTRS) {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
@@ -92,7 +89,6 @@ export function rewriteHtml(
     });
   }
 
-  // 2) [srcset] on any element
   $("[srcset], [data-srcset], [imagesrcset]").each((_, el) => {
     for (const a of ["srcset", "data-srcset", "imagesrcset"] as const) {
       const v = $(el).attr(a);
@@ -109,19 +105,16 @@ export function rewriteHtml(
     }
   });
 
-  // 3) Inline style
   $("[style]").each((_, el) => {
     const s = $(el).attr("style");
     if (s) $(el).attr("style", rewriteUrlCallsInString(s, base));
   });
 
-  // 4) <style> blocks
   $("style").each((_, el) => {
     const t = $(el).html();
     if (t) $(el).html(rewriteCss(t, base));
   });
 
-  // 5) importmap
   $('script[type="importmap"], script[type=importmap], script[type="importmap+json"]').each((_, el) => {
     const t = $(el).html();
     if (!t) return;
@@ -153,7 +146,6 @@ export function rewriteHtml(
     } catch { /* keep */ }
   });
 
-  // 6) meta refresh
   $("meta").each((_, el) => {
     const h = String($(el).attr("http-equiv") ?? "");
     if (h.toLowerCase() !== "refresh") return;
@@ -166,7 +158,6 @@ export function rewriteHtml(
     }
   });
 
-  // 7) Generic attribute sweep (lazy-loading / framework-specific data-*)
   $("*").each((_, n) => {
     const node = $(n).get(0) as { type?: string; attribs?: Record<string, string> } | undefined;
     if (!node || node.type !== "tag" || !node.attribs) return;
@@ -178,20 +169,55 @@ export function rewriteHtml(
       if (next) node.attribs[name] = next;
     }
   });
+}
 
-  // 8) <head> inject: base, referrer, client runtime
+/** Inert <template> / <noscript> content: rewrites only, no <base> / runtime. */
+function rewriteInertSubfragments($: CheerioAPI, base: string): void {
+  $("template, noscript").each((_, el) => {
+    const inner = $(el).html();
+    if (inner) {
+      $(el).html(rewriteInertFragment(inner, base));
+    }
+  });
+}
+
+function rewriteInertFragment(html: string, base: string): string {
+  const $ = cheerio.load(html, { xml: false });
+  applyCoreRewrites($, base);
+  rewriteInertSubfragments($, base);
+  return $.html();
+}
+
+export function rewriteHtml(
+  html: string,
+  base: string,
+  injectClientRuntime: boolean,
+): string {
+  const $ = cheerio.load(html, { xml: false });
+  applyCoreRewrites($, base);
+  rewriteInertSubfragments($, base);
+
   const safeBase = base.replace(/"/g, "&quot;");
   const origin = new URL(base).origin;
   const headInject: string[] = [
     `<base href="${safeBase}">`,
-    '<meta name="referrer" content="no-referrer">',
   ];
   if (injectClientRuntime) {
     headInject.push(
-      `<script data-proxy="runtime">\n${buildClientRuntimePatch(origin)}\n<\/script>`,
+      `<script data-proxy="runtime" type="text/javascript">\n${buildClientRuntimePatch(origin)}<\/script>`,
     );
   }
-  $("head").prepend(headInject.join(""));
+  headInject.push('<meta name="referrer" content="no-referrer">');
+
+  const joined = headInject.join("");
+  const heads = $("head");
+  if (heads.length) {
+    heads.prepend(joined);
+  } else {
+    const c = $.root().children();
+    if (c.length) c.first().prepend(joined);
+    else $.root().prepend(joined);
+  }
 
   return $.html();
 }
