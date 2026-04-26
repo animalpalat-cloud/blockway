@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #0f172a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-inter), Inter, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+  border-color: #e2e8f0;
+}
+
+::selection {
+  background: #bfdbfe;
+  color: #0f172a;
+}
+
+/* ── Mesh-gradient hero background ── */
+.hero-mesh {
+  background-color: #eff6ff;
+  background-image:
+    radial-gradient(at 20% 20%, rgba(147, 197, 253, 0.5) 0px, transparent 50%),
+    radial-gradient(at 80% 10%, rgba(196, 219, 254, 0.6) 0px, transparent 45%),
+    radial-gradient(at 50% 80%, rgba(224, 231, 255, 0.7) 0px, transparent 50%),
+    radial-gradient(at 90% 70%, rgba(186, 230, 253, 0.4) 0px, transparent 40%);
+}
+
+/* ── Animated spinner ── */
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+.animate-spin-slow { animation: spin-slow 3s linear infinite; }
+
+/* ── Subtle float ── */
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-8px); }
+}
+.animate-float { animation: float 4s ease-in-out infinite; }
+
+/* ── Progress bar pulse ── */
+@keyframes progress-pulse {
+  0%   { width: 0%;   opacity: 1; }
+  60%  { width: 80%;  opacity: 1; }
+  100% { width: 100%; opacity: 0; }
+}
+.animate-progress { animation: progress-pulse 1.8s ease forwards; }
+
+/* ── Fade-up (for non-framer usage) ── */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up { animation: fade-up 0.55s ease both; }
+
+/* ── Shimmer skeleton ── */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+.animate-shimmer {
+  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+}
