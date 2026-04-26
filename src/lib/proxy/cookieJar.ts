@@ -86,6 +86,10 @@ export function cookieHeaderForHost(sessionId: string, host: string): string | n
 }
 
 export function newSessionId(): string {
-  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
-  return `s_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  try {
+    // randomUUID is always on Crypto in our TS lib; do not `if (fn)`-check it (always truthy)
+    return globalThis.crypto.randomUUID();
+  } catch {
+    return `s_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  }
 }
