@@ -28,7 +28,6 @@ function isBlockedTarget(url: URL): boolean {
   const h = url.hostname.toLowerCase();
   if (["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(h)) return true;
   if (h.endsWith(".local")) return true;
-  // Block private IPv4 ranges
   const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (m) {
     const [a, b] = [+m[1], +m[2]];
@@ -66,7 +65,7 @@ function skipRewrite(v: string): boolean {
 }
 
 function rewriteHtml(html: string, base: string): string {
-  const $ = cheerio.load(html, { decodeEntities: false });
+  const $ = cheerio.load(html);
 
   const ATTRS: { sel: string; attr: string }[] = [
     { sel: "a[href]",       attr: "href"   },
@@ -85,7 +84,7 @@ function rewriteHtml(html: string, base: string): string {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
       if (!v || skipRewrite(v)) return;
-      try { $(el).attr(attr, proxyHref(new URL(v, base).toString())); } catch { /* keep original */ }
+      try { $(el).attr(attr, proxyHref(new URL(v, base).toString())); } catch {}
     });
   });
 
@@ -164,7 +163,6 @@ async function doProxy(targetUrlStr: string, reqHeaders: Headers): Promise<NextR
   }
   clearTimeout(timer);
 
-  // Size guard
   const maxBytes     = MAX_SIZE_MB * 1024 * 1024;
   const declaredSize = Number(upstream.headers.get("content-length") ?? 0);
   if (declaredSize && declaredSize > maxBytes) {
@@ -179,7 +177,6 @@ async function doProxy(targetUrlStr: string, reqHeaders: Headers): Promise<NextR
     return NextResponse.json({ error: "Response too large." }, { status: 413 });
   }
 
-  // Rewrite HTML / CSS
   const isHtml = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
   const isCss  = contentType.includes("text/css");
 
@@ -189,7 +186,6 @@ async function doProxy(targetUrlStr: string, reqHeaders: Headers): Promise<NextR
     bodyBuffer = Buffer.from(rewriteCss(bodyBuffer.toString("utf-8"), finalUrl), "utf-8");
   }
 
-  // Build clean response headers
   const resHeaders = new Headers();
   upstream.headers.forEach((value, key) => {
     if (!STRIP_HEADERS.has(key.toLowerCase())) resHeaders.set(key, value);
@@ -204,7 +200,6 @@ async function doProxy(targetUrlStr: string, reqHeaders: Headers): Promise<NextR
   return new NextResponse(bodyBuffer, { status: upstream.status, headers: resHeaders });
 }
 
-// ─── Route exports ─────────────────────────────────────────────────────────────
 export async function GET(request: NextRequest) {
   const url = request.nextUrl.searchParams.get("url") ?? "";
   return doProxy(url, request.headers);
