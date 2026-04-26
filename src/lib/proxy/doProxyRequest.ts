@@ -1,16 +1,16 @@
 import { type NextRequest, NextResponse } from "next/server";
 import {
+  absorbPuppeteerCookies,
   absorbSetCookieHeaders,
   cookieHeaderForHost,
   newSessionId,
 } from "./cookieJar";
 import { rewriteHtml } from "./rewriteHtml";
 import { rewriteCss } from "./rewriteCss";
+import { renderWithPuppeteer } from "./puppeteerRender";
 import { STRIP_FROM_RESPONSE, buildUpstreamRequestHeaders } from "./upstreamHeaders";
 import { isBlockedTarget, normalizeUrl, SESSION_COOKIE } from "./urls";
-
-const TIMEOUT_MS  = 45_000;
-const MAX_SIZE_MB = 32;
+import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 
@@ -34,6 +34,35 @@ function json(message: string, status: number, sessionId: string): NextResponse 
   return res;
 }
 
+function buildPuppeteerProxyResponse(
+  body: Buffer,
+  options: {
+    status: number;
+    sessionId: string;
+    jarHost: string;
+    finalUrl: string;
+  },
+): NextResponse {
+  const { status, sessionId, jarHost, finalUrl } = options;
+  const resHeaders = new Headers();
+  resHeaders.set("content-type", "text/html; charset=utf-8");
+  resHeaders.set("x-proxy-render", "puppeteer");
+  resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
+  resHeaders.set("pragma", "no-cache");
+  resHeaders.set("access-control-allow-origin", "*");
+  resHeaders.set(
+    "access-control-expose-headers",
+    "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render",
+  );
+  resHeaders.set("x-proxy-final-url", finalUrl);
+  resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
+  resHeaders.delete("content-length");
+  resHeaders.delete("content-encoding");
+  const res = new NextResponse(new Uint8Array(body), { status, headers: resHeaders });
+  attachSessionCookie(res, sessionId);
+  return res;
+}
+
 export async function doProxy(
   request: NextRequest,
   targetUrlStr: string,
@@ -49,12 +78,39 @@ export async function doProxy(
     return json("Target URL is blocked for security reasons.", 403, sessionId);
   }
 
+  const jarHost = parsed.hostname;
+  const maxBytes = MAX_SIZE_MB * 1024 * 1024;
+
+  if (method === "GET" && shouldRenderHtmlWithPuppeteer(request, parsed)) {
+    try {
+      const r = await renderWithPuppeteer(
+        parsed,
+        request.headers,
+        sessionId,
+        jarHost,
+      );
+      absorbPuppeteerCookies(sessionId, r.cookies);
+      const out = Buffer.from(rewriteHtml(r.html, r.finalUrl, true), "utf-8");
+      if (out.length > maxBytes) {
+        return json("Response too large.", 413, sessionId);
+      }
+      return buildPuppeteerProxyResponse(out, {
+        status: r.status,
+        sessionId,
+        jarHost,
+        finalUrl: r.finalUrl,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Puppeteer render failed.";
+      console.error("[proxy] Puppeteer failed, falling back to fetch:", msg);
+    }
+  }
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
 
   let upstream: Response;
-  const jarHost = parsed.hostname;
-  const headers   = buildUpstreamRequestHeaders(
+  const headers = buildUpstreamRequestHeaders(
     request.headers,
     parsed,
     { sessionId, jarHost },
@@ -79,15 +135,14 @@ export async function doProxy(
 
   absorbSetCookieHeaders(sessionId, jarHost, upstream.headers);
 
-  const maxBytes     = MAX_SIZE_MB * 1024 * 1024;
-  const cl             = Number(upstream.headers.get("content-length") ?? 0);
+  const cl = Number(upstream.headers.get("content-length") ?? 0);
   if (cl && cl > maxBytes) {
     return json("Response too large.", 413, sessionId);
   }
 
-  const contentType  = upstream.headers.get("content-type") ?? "application/octet-stream";
-  const finalUrl     = upstream.url || parsed.toString();
-  const hasBody      = method !== "HEAD";
+  const contentType = upstream.headers.get("content-type") ?? "application/octet-stream";
+  const finalUrl = upstream.url || parsed.toString();
+  const hasBody = method !== "HEAD";
   const buf = hasBody
     ? Buffer.from(await upstream.arrayBuffer())
     : Buffer.alloc(0);
@@ -95,10 +150,10 @@ export async function doProxy(
     return json("Response too large.", 413, sessionId);
   }
 
-  const ct         = contentType.toLowerCase();
-  const isHtml     = ct.includes("text/html") || ct.includes("application/xhtml+xml");
-  const isCss      = ct.includes("text/css");
-  const sniffHtml  =
+  const ct = contentType.toLowerCase();
+  const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
+  const isCss = ct.includes("text/css");
+  const sniffHtml =
     isHtml ||
     (ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
 
@@ -121,17 +176,19 @@ export async function doProxy(
   } else if (isCss) {
     resHeaders.set("content-type", "text/css; charset=utf-8");
   }
+  if (!resHeaders.get("x-proxy-render")) {
+    resHeaders.set("x-proxy-render", "fetch");
+  }
 
   resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
   resHeaders.set("pragma", "no-cache");
   resHeaders.set("access-control-allow-origin", "*");
   resHeaders.set(
     "access-control-expose-headers",
-    "x-proxy-final-url, content-type, x-proxy-session",
+    "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render",
   );
   resHeaders.set("x-proxy-final-url", finalUrl);
   resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
-
   resHeaders.delete("content-length");
   resHeaders.delete("content-encoding");
 

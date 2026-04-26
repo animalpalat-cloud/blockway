@@ -1,8 +1,11 @@
 import { doProxy } from "@/lib/proxy/doProxyRequest";
 import { type NextRequest, NextResponse } from "next/server";
 
-export const dynamic   = "force-dynamic";
+/** Puppeteer only runs in the Node.js runtime, not Edge. */
+export const runtime    = "nodejs";
+export const dynamic    = "force-dynamic";
 export const revalidate = 0;
+export const maxDuration = 120;
 
 function jsonError(message: string, status: number) {
   return NextResponse.json({ error: message }, { status });
@@ -44,7 +47,7 @@ export async function OPTIONS() {
       "Access-Control-Allow-Origin":  "*",
       "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
       "Access-Control-Allow-Headers":
-        "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization",
+        "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With",
       "Access-Control-Max-Age":       "86400",
     },
   });

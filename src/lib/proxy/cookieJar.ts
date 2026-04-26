@@ -63,6 +63,26 @@ export function absorbSetCookieHeaders(
   bySession.set(sessionId, jar);
 }
 
+/**
+ * Merge cookies returned from Puppeteer's `page.cookies()` into the jar
+ * (per cookie domain) so the next fetch/visit replays the same state.
+ */
+export function absorbPuppeteerCookies(
+  sessionId: string,
+  cookies: { name: string; value: string; domain?: string }[],
+): void {
+  if (cookies.length === 0) return;
+  const jar = jarForSession(sessionId);
+  for (const c of cookies) {
+    const d = (c.domain ?? "").replace(/^\./, "").toLowerCase();
+    if (!d) continue;
+    const forHost = jar.get(d) ?? new Map<string, string>();
+    forHost.set(c.name, `${c.name}=${c.value}`);
+    jar.set(d, forHost);
+  }
+  bySession.set(sessionId, jar);
+}
+
 function getSetCookieLines(headers: Headers): string[] {
   const h = headers as unknown as { getSetCookie?: () => string[] };
   if (typeof h.getSetCookie === "function") {
