@@ -11,10 +11,21 @@ export const MAX_SIZE_MB = Number(process.env.PROXY_MAX_SIZE_MB) || 32;
 export const PROXY_PUPPETEER_ENABLED = process.env.PROXY_PUPPETEER !== "0";
 
 const DEFAULT_HEADLESS_HOSTS = [
+  "youtube.com",
+  "www.youtube.com",
+  "twitter.com",
+  "x.com",
+  "www.x.com",
+  "facebook.com",
+  "www.facebook.com",
+  "instagram.com",
+  "www.instagram.com",
   "reddit.com",
   "www.reddit.com",
   "old.reddit.com",
   "new.reddit.com",
+  "tiktok.com",
+  "www.tiktok.com",
 ];
 
 /**
@@ -44,6 +55,33 @@ function hostnameMatchesList(hostname: string, list: string[]): boolean {
 }
 
 /**
+ * Lightweight Cloudflare challenge heuristics so problematic pages can
+ * automatically use headless rendering.
+ */
+function looksLikeCloudflareProtected(request: NextRequest, target: URL): boolean {
+  const q = target.search.toLowerCase();
+  const p = target.pathname.toLowerCase();
+  if (p.includes("/cdn-cgi/")) return true;
+  if (
+    q.includes("__cf_chl_tk") ||
+    q.includes("cf_chl_") ||
+    q.includes("__cf_chl_rt_tk")
+  ) {
+    return true;
+  }
+
+  const cookie = (request.headers.get("cookie") || "").toLowerCase();
+  if (cookie.includes("cf_clearance=") || cookie.includes("__cf_bm=")) {
+    return true;
+  }
+
+  const ua = (request.headers.get("user-agent") || "").toLowerCase();
+  if (ua.includes("cloudflare")) return true;
+
+  return false;
+}
+
+/**
  * When to render the top-level HTML with Puppeteer (JS-heavy pages).
  * Assets and subresources still go through the normal fetch proxy.
  */
@@ -57,6 +95,7 @@ export function shouldRenderHtmlWithPuppeteer(
   if (sp.get("headless") === "0" || sp.get("render") === "0") return false;
 
   const list = parsedHeadlessHostList();
-  if (list.length === 0) return false;
-  return hostnameMatchesList(target.hostname, list);
+  if (list.length > 0 && hostnameMatchesList(target.hostname, list)) return true;
+  if (looksLikeCloudflareProtected(request, target)) return true;
+  return false;
 }
