@@ -14,6 +14,19 @@ import { isBlockedTarget, normalizeUrl, SESSION_COOKIE } from "./urls";
 import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
+const CORS_ALLOW_METHODS = "GET, POST, HEAD, OPTIONS";
+const CORS_ALLOW_HEADERS =
+  "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer";
+const CORS_EXPOSE_HEADERS =
+  "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render";
+
+function applyCorsHeaders(headers: Headers): void {
+  headers.set("access-control-allow-origin", "*");
+  headers.set("access-control-allow-methods", CORS_ALLOW_METHODS);
+  headers.set("access-control-allow-headers", CORS_ALLOW_HEADERS);
+  headers.set("access-control-max-age", "86400");
+  headers.set("access-control-expose-headers", CORS_EXPOSE_HEADERS);
+}
 
 function getSessionId(request: NextRequest): string {
   return request.cookies.get(SESSION_COOKIE)?.value || newSessionId();
@@ -31,6 +44,7 @@ function attachSessionCookie(res: NextResponse, sessionId: string): void {
 
 function json(message: string, status: number, sessionId: string): NextResponse {
   const res = NextResponse.json({ error: message }, { status });
+  applyCorsHeaders(res.headers);
   attachSessionCookie(res, sessionId);
   return res;
 }
@@ -50,11 +64,7 @@ function buildPuppeteerProxyResponse(
   resHeaders.set("x-proxy-render", "puppeteer");
   resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
   resHeaders.set("pragma", "no-cache");
-  resHeaders.set("access-control-allow-origin", "*");
-  resHeaders.set(
-    "access-control-expose-headers",
-    "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render",
-  );
+  applyCorsHeaders(resHeaders);
   resHeaders.set("x-proxy-final-url", finalUrl);
   resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
   resHeaders.delete("content-length");
@@ -190,11 +200,7 @@ export async function doProxy(
 
   resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
   resHeaders.set("pragma", "no-cache");
-  resHeaders.set("access-control-allow-origin", "*");
-  resHeaders.set(
-    "access-control-expose-headers",
-    "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render",
-  );
+  applyCorsHeaders(resHeaders);
   resHeaders.set("x-proxy-final-url", finalUrl);
   resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
   resHeaders.delete("content-length");

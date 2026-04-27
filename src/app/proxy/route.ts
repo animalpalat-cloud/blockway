@@ -8,7 +8,15 @@ export const revalidate = 0;
 export const maxDuration = 120;
 
 function jsonError(message: string, status: number) {
-  return NextResponse.json({ error: message }, { status });
+  const res = NextResponse.json({ error: message }, { status });
+  res.headers.set("Access-Control-Allow-Origin", "*");
+  res.headers.set("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
+  res.headers.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer",
+  );
+  res.headers.set("Access-Control-Max-Age", "86400");
+  return res;
 }
 
 export async function GET(request: NextRequest) {
@@ -35,19 +43,28 @@ export async function POST(request: NextRequest) {
 export async function HEAD(request: NextRequest) {
   const url = request.nextUrl.searchParams.get("url") ?? "";
   if (!url.trim()) {
-    return new NextResponse(null, { status: 400 });
+    const res = new NextResponse(null, { status: 400 });
+    res.headers.set("Access-Control-Allow-Origin", "*");
+    res.headers.set("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
+    res.headers.set(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer",
+    );
+    res.headers.set("Access-Control-Max-Age", "86400");
+    return res;
   }
   return doProxy(request, url, "HEAD");
 }
 
-export async function OPTIONS() {
+export async function OPTIONS(request: NextRequest) {
+  const reqHeaders = request.headers.get("access-control-request-headers");
   return new NextResponse(null, {
     status: 204,
     headers: {
       "Access-Control-Allow-Origin":  "*",
       "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-      "Access-Control-Allow-Headers":
-        "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With",
+      "Access-Control-Allow-Headers": reqHeaders
+        || "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer",
       "Access-Control-Max-Age":       "86400",
     },
   });
