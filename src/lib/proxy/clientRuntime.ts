@@ -17,6 +17,9 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   var Oi = (function () {
     try { return new U0(O + "/").origin; } catch (e) { return O.replace(/\\/$/, ""); }
   })();
+  var tHostname = (function () {
+    try { return new U0(O + "/").hostname; } catch (eH) { return ""; }
+  })();
 
   function isSkip(s) {
     if (s == null) return true;
@@ -73,17 +76,26 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     return false;
   }
 
-  /** e.g. new URL("/proxy?url=...", "https://target/") -> https://target/proxy?... */
-  function fixBaseMisresolvedProxy(x) {
+  function isTargetHostProxyPath(x) {
+    if (!x) return false;
+    if (!(x.pathname === "/proxy" || x.pathname.indexOf("/proxy/") === 0)) return false;
+    if (!x.search || x.search.indexOf("url=") < 0) return false;
+    try {
+      if (tHostname && x.hostname && x.hostname.toLowerCase() === tHostname.toLowerCase()) return true;
+    } catch (e) {}
+    try {
+      if (Oi && x.origin === Oi) return true;
+    } catch (e0) {}
+    return false;
+  }
+
+  /**
+   * Full URL (or <base> mis-resolved) like https://<targetHost>/proxy?url=… — re-host on P.
+   */
+  function fixTargetOrMisresolvedProxyUrl(x) {
     if (!P || !x) return x;
     try {
-      if (x.origin === Oi) {
-        if (x.pathname === "/proxy" || x.pathname.indexOf("/proxy/") === 0) {
-          if (x.search && x.search.indexOf("url=") >= 0) {
-            return new U0(P + x.pathname + x.search + (x.hash || ""));
-          }
-        }
-      }
+      if (isTargetHostProxyPath(x)) return new U0(P + x.pathname + x.search + (x.hash || ""));
     } catch (e5) {}
     return x;
   }
@@ -96,14 +108,11 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     var r = mainLoc && mainLoc.href ? mainLoc.href : O + "/";
     try {
       var x = /^[a-zA-Z][a-zA-Z+.-]*:/.test(s) ? new U0(s) : new U0(s, baseUrl());
-      x = fixBaseMisresolvedProxy(x) || x;
+      x = fixTargetOrMisresolvedProxyUrl(x) || x;
       var okP =
         x.protocol === "http:" || x.protocol === "https:" || x.protocol === "ws:" || x.protocol === "wss:";
       if (!okP) return u;
       if (isAlreadyProxied(x.href)) return x.href;
-      if (P && x.origin === Oi && (x.pathname === "/proxy" || x.pathname.indexOf("/proxy/") === 0) && x.search && x.search.indexOf("url=") >= 0) {
-        return P + x.pathname + x.search + (x.hash || "");
-      }
       return "/proxy?url=" + encodeURIComponent(x.href) + "&ref=" + encodeURIComponent(r);
     } catch (e6) {
       return u;
@@ -112,7 +121,7 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
 
   var URL1 = function (input, base) {
     var u = base !== undefined ? new U0(input, base) : new U0(input);
-    return fixBaseMisresolvedProxy(u) || u;
+    return fixTargetOrMisresolvedProxyUrl(u) || u;
   };
   try {
     URL1.prototype = U0.prototype;
@@ -319,12 +328,9 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   }
 
   try {
-    if (Location && Location.prototype) {
-      var tBase = (function () {
-        try { return new U0(O + "/"); } catch (eL) { return null; }
-      })();
-      if (tBase) {
+    if (Location && Location.prototype && P) {
         var propMap = { hostname: 1, host: 1, origin: 1, port: 1, protocol: 1, pathname: 1, search: 1, hash: 1, href: 1 };
+        var Pu = new U0(P + "/");
         Object.keys(propMap).forEach(function (name) {
           try {
             var d0 = Object.getOwnPropertyDescriptor(Location.prototype, name);
@@ -334,11 +340,13 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
               configurable: true,
               get: function () {
                 if (this === mainLoc) {
-                  if (name === "hostname") return tBase.hostname;
-                  if (name === "host") return tBase.host;
-                  if (name === "origin") return tBase.origin;
-                  if (name === "port") return tBase.port;
-                  if (name === "protocol") return tBase.protocol;
+                  if (Pu) {
+                    if (name === "hostname") return Pu.hostname;
+                    if (name === "host") return Pu.host;
+                    if (name === "origin") return P;
+                    if (name === "port") return Pu.port;
+                    if (name === "protocol") return Pu.protocol;
+                  }
                   if (name === "pathname" || name === "search" || name === "hash" || name === "href") {
                     var t = targetPSH();
                     if (name === "href") return targetHrefForLocation();
@@ -366,22 +374,20 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
           var lr0 = Location.prototype.replace;
           Location.prototype.replace = function (u) { return lr0.call(this, p(String(u))); };
         }
-      }
     }
   } catch (eLoc) {}
 
   try {
     if (P) {
-      Object.defineProperty(window, "origin", { configurable: true, get: function () { return Oi; } });
+      Object.defineProperty(window, "origin", { configurable: true, get: function () { return P; } });
     }
   } catch (eW) {}
   try {
-    var tBase2 = new U0(O + "/");
-    var domHost = tBase2.hostname;
-    if (domHost) {
+    if (P) {
+      var dPu = new U0(P + "/");
       Object.defineProperty(document, "domain", {
         configurable: true,
-        get: function () { return domHost; },
+        get: function () { return dPu.hostname; },
         set: function () { /* no-op: assignment could throw */ }
       });
     }
@@ -396,6 +402,16 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     Object.defineProperty(document, "URL", { configurable: true, get: function () { return docHref; } });
     Object.defineProperty(document, "documentURI", { configurable: true, get: function () { return docHref; } });
   } catch (eDoc) {}
+  try {
+    if (mainLoc && mainLoc.href) {
+      Object.defineProperty(document, "baseURI", {
+        configurable: true,
+        get: function () {
+          return String(mainLoc.href);
+        }
+      });
+    }
+  } catch (eBase) {}
 
   var moR = 0;
   var ATTRS = { src: 1, href: 1, action: 1, formaction: 1, poster: 1, data: 1, srcset: 1, imagesrcset: 1, cite: 1, background: 1, form: 1 };
