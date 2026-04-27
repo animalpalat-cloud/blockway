@@ -2,55 +2,59 @@ import * as cheerio from "cheerio";
 import type { CheerioAPI } from "cheerio";
 import { buildClientRuntimePatch } from "./clientRuntime";
 import { absUrl, isLikelyUrl, proxyParamUrl, skipRewrite } from "./urls";
-import { rewriteCss, rewriteUrlCallsInString } from "./rewriteCss";
 
-// Prefer explicit first pass; then generic sweep
 const URL_ATTRS: { sel: string; attr: string }[] = [
-  { sel: "a[href]",              attr: "href" },
-  { sel: "area[href]",         attr: "href" },
-  { sel: "link[href]",         attr: "href" },
-  { sel: "img[src]",            attr: "src" },
-  { sel: "img[data-src]",       attr: "data-src" },
-  { sel: "img[data-original]",  attr: "data-original" },
-  { sel: "img[data-lazy-src]",  attr: "data-lazy-src" },
-  { sel: "img[data-lazy]",     attr: "data-lazy" },
-  { sel: "img[data-srcset]",   attr: "data-srcset" },
-  { sel: "script[src]",         attr: "src" },
-  { sel: "iframe[src]",         attr: "src" },
-  { sel: "embed[src]",         attr: "src" },
-  { sel: "object[data]",         attr: "data" },
-  { sel: "source[src]",         attr: "src" },
-  { sel: "track[src]",         attr: "src" },
-  { sel: "video[src]",         attr: "src" },
-  { sel: "video[poster]",      attr: "poster" },
-  { sel: "audio[src]",         attr: "src" },
-  { sel: "form[action]",       attr: "action" },
-  { sel: "form[formaction]",   attr: "formaction" },
-  { sel: "input[formaction]",  attr: "formaction" },
-  { sel: "button[formaction]", attr: "formaction" },
-  { sel: "use[href]",          attr: "href" },
-  { sel: "image[href]",        attr: "href" },
-  { sel: "source[data-src]",   attr: "data-src" },
-  { sel: "source[data-srcset]", attr: "data-srcset" },
+  { sel: "a[href]", attr: "href" },
+  { sel: "img[src]", attr: "src" },
+  { sel: "link[href]", attr: "href" },
 ];
 
-function shouldAttrRewrite(n: string): boolean {
-  const l = n.toLowerCase();
-  if (
-    ["href", "src", "poster", "action", "formaction", "cite", "srcset", "imagesrcset", "data-srcset"].includes(l)
-  ) {
-    return true;
-  }
-  if (l.startsWith("data-") && /src|href|url|load|image|icon|file/i.test(l)) return true;
-  if (l === "xlink:href" || l.endsWith(":href")) return true;
-  return false;
+const TRACKING_PATTERNS = [
+  "cloudflareinsights.com",
+  "google-analytics.com",
+  "googletagmanager.com",
+  "doubleclick.net",
+  "redditstatic.com/ads",
+  "reddit.com/tracking",
+  "/analytics",
+  "/track",
+  "/pixel",
+];
+
+const AUTH_PATH_PATTERNS = [
+  "/login",
+  "/signin",
+  "/signup",
+  "/register",
+  "/oauth",
+  "/auth",
+  "/session",
+  "/account",
+];
+
+function isTrackingOrThirdPartyScript(url: string): boolean {
+  const s = url.toLowerCase();
+  return TRACKING_PATTERNS.some((p) => s.includes(p));
+}
+
+function isAuthLikeEndpoint(url: string): boolean {
+  const s = url.toLowerCase();
+  return AUTH_PATH_PATTERNS.some((p) => s.includes(p));
 }
 
 function rewriteAttributeValue(val: string, base: string): string | null {
-  if (skipRewrite(val) || val.includes("proxy?url=")) return null;
+  const trimmed = (val ?? "").trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("data:")) return trimmed;
+  if (skipRewrite(trimmed) || trimmed.includes("proxy?url=")) return null;
+  if (isTrackingOrThirdPartyScript(trimmed)) return null;
+  if (isAuthLikeEndpoint(trimmed)) return null;
+  if (/\.woff2?(?:$|\?)/i.test(trimmed)) return null;
   if (!isLikelyUrl(val)) return null;
-  const abs = absUrl(val, base);
+  const abs = absUrl(trimmed, base);
   if (!abs) return null;
+  if (isAuthLikeEndpoint(abs) || isTrackingOrThirdPartyScript(abs)) return null;
+  if (/\.woff2?(?:$|\?)/i.test(abs)) return null;
   return proxyParamUrl(abs, base);
 }
 
@@ -74,101 +78,38 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
   ).remove();
   $('link[rel="manifest"], link[rel=manifest], link[rel="serviceworker"], link[rel=serviceworker]').remove();
   $("script").each((_, el) => {
-    const t = String($(el).html() || "");
-    if (/\bnavigator\.serviceWorker\.register\b/.test(t)) {
+    const src = String($(el).attr("src") || "");
+    const type = String($(el).attr("type") || "").toLowerCase();
+    // Static-browsing mode: remove executable scripts.
+    if (type !== "application/ld+json") {
       $(el).remove();
+      return;
     }
+    if (src && isTrackingOrThirdPartyScript(src)) $(el).remove();
   });
+  $("iframe[src], embed[src], object[data]").remove();
+  $("form[action], input[formaction], button[formaction]").remove();
 
   for (const { sel, attr } of URL_ATTRS) {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
       if (!v) return;
+      if (sel === "link[href]") {
+        const rel = String($(el).attr("rel") || "").toLowerCase();
+        const isCss = rel.includes("stylesheet") || /\.css(?:$|\?)/i.test(v);
+        if (!isCss) return;
+      }
+      if (sel === "a[href]") {
+        const aAbs = absUrl(v, base) || v;
+        if (isAuthLikeEndpoint(aAbs)) {
+          $(el).attr(attr, "#");
+          return;
+        }
+      }
       const next = rewriteAttributeValue(v, base);
-      if (next) $(el).attr(attr, next);
+      if (next && next !== v) $(el).attr(attr, next);
     });
   }
-
-  $("[srcset], [data-srcset], [imagesrcset]").each((_, el) => {
-    for (const a of ["srcset", "data-srcset", "imagesrcset"] as const) {
-      const v = $(el).attr(a);
-      if (!v) continue;
-      const parts = v.split(",").map((entry) => {
-        const p = entry.trim().split(/\s+/);
-        const u = p[0];
-        const rest = p.slice(1).join(" ");
-        if (!u) return entry;
-        const n = rewriteAttributeValue(u, base);
-        return n ? (rest ? `${n} ${rest}` : n) : entry;
-      });
-      $(el).attr(a, parts.join(", "));
-    }
-  });
-
-  $("[style]").each((_, el) => {
-    const s = $(el).attr("style");
-    if (s) $(el).attr("style", rewriteUrlCallsInString(s, base));
-  });
-
-  $("style").each((_, el) => {
-    const t = $(el).html();
-    if (t) $(el).html(rewriteCss(t, base));
-  });
-
-  $('script[type="importmap"], script[type=importmap], script[type="importmap+json"]').each((_, el) => {
-    const t = $(el).html();
-    if (!t) return;
-    try {
-      const j = JSON.parse(t) as {
-        imports?: Record<string, string>;
-        scopes?: Record<string, Record<string, string>>;
-      };
-      if (j.imports) {
-        for (const k of Object.keys(j.imports)) {
-          const v = j.imports[k];
-          if (typeof v !== "string") continue;
-          const abs = absUrl(v, base) ?? new URL(v, base).toString();
-          j.imports[k] = proxyParamUrl(abs, base);
-        }
-      }
-      if (j.scopes) {
-        for (const sc of Object.values(j.scopes)) {
-          for (const k of Object.keys(sc)) {
-            const v = sc[k];
-            if (typeof v === "string") {
-              const abs = absUrl(v, base) ?? new URL(v, base).toString();
-              sc[k] = proxyParamUrl(abs, base);
-            }
-          }
-        }
-      }
-      $(el).html(JSON.stringify(j));
-    } catch { /* keep */ }
-  });
-
-  $("meta").each((_, el) => {
-    const h = String($(el).attr("http-equiv") ?? "");
-    if (h.toLowerCase() !== "refresh") return;
-    const c = $(el).attr("content");
-    if (!c) return;
-    const m = c.match(/url\s*=\s*(['"]?)([^'";]+)\1/i);
-    if (m?.[2]) {
-      const abs = absUrl(m[2], base);
-      if (abs) $(el).attr("content", c.replace(m[0], `url=${proxyParamUrl(abs, base)}`));
-    }
-  });
-
-  $("*").each((_, n) => {
-    const node = $(n).get(0) as { type?: string; attribs?: Record<string, string> } | undefined;
-    if (!node || node.type !== "tag" || !node.attribs) return;
-    for (const name of Object.keys(node.attribs)) {
-      if (!shouldAttrRewrite(name)) continue;
-      const v = node.attribs[name];
-      if (v == null) continue;
-      const next = rewriteAttributeValue(String(v), base);
-      if (next) node.attribs[name] = next;
-    }
-  });
 }
 
 /** Inert <template> / <noscript> content: rewrites only, no <base> / runtime. */

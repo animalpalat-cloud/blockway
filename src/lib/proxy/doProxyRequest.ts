@@ -14,7 +14,7 @@ import { isBlockedTarget, normalizeUrl, SESSION_COOKIE } from "./urls";
 import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
-const CORS_ALLOW_METHODS = "GET, POST, HEAD, OPTIONS";
+const CORS_ALLOW_METHODS = "GET";
 const CORS_ALLOW_HEADERS =
   "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer";
 const CORS_EXPOSE_HEADERS =
@@ -105,7 +105,7 @@ export async function doProxy(
         documentReferer,
       );
       absorbPuppeteerCookies(sessionId, r.cookies);
-      const out = Buffer.from(rewriteHtml(r.html, r.finalUrl, true), "utf-8");
+      const out = Buffer.from(rewriteHtml(r.html, r.finalUrl, false), "utf-8");
       if (out.length > maxBytes) {
         return json("Response too large.", 413, sessionId);
       }
@@ -175,8 +175,6 @@ export async function doProxy(
   let body: Buffer = buf;
   if (hasBody && sniffHtml) {
     body = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true), "utf-8");
-  } else if (hasBody && isCss) {
-    body = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
   }
 
   const resHeaders = new Headers();
