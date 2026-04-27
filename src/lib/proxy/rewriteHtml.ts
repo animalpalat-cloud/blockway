@@ -1,6 +1,5 @@
 import * as cheerio from "cheerio";
 import type { CheerioAPI } from "cheerio";
-import { buildClientRuntimePatch } from "./clientRuntime";
 import { absUrl, isLikelyUrl, proxyParamUrl, skipRewrite } from "./urls";
 
 const URL_ATTRS: { sel: string; attr: string }[] = [
@@ -77,16 +76,7 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
     'link[rel="preconnect"], link[rel=preconnect], link[rel="dns-prefetch"], link[rel=dns-prefetch], link[rel="prerender"]',
   ).remove();
   $('link[rel="manifest"], link[rel=manifest], link[rel="serviceworker"], link[rel=serviceworker]').remove();
-  $("script").each((_, el) => {
-    const src = String($(el).attr("src") || "");
-    const type = String($(el).attr("type") || "").toLowerCase();
-    // Static-browsing mode: remove executable scripts.
-    if (type !== "application/ld+json") {
-      $(el).remove();
-      return;
-    }
-    if (src && isTrackingOrThirdPartyScript(src)) $(el).remove();
-  });
+  $("script").remove();
   $("iframe[src], embed[src], object[data]").remove();
   $("form[action], input[formaction], button[formaction]").remove();
 
@@ -138,15 +128,11 @@ export function rewriteHtml(
   applyCoreRewrites($, base);
   rewriteInertSubfragments($, base);
 
-  const safeBase = base.replace(/"/g, "&quot;");
   const origin = new URL(base).origin;
-  const headInject: string[] = [
-    `<base href="${safeBase}">`,
-  ];
+  const headInject: string[] = [];
   if (injectClientRuntime) {
-    headInject.push(
-      `<script data-proxy="runtime" type="text/javascript">\n${buildClientRuntimePatch(origin)}<\/script>`,
-    );
+    // Intentionally no runtime injection for static-browsing mode.
+    void origin;
   }
   headInject.push('<meta name="referrer" content="no-referrer">');
 
