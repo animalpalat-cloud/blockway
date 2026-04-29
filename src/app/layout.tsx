@@ -15,6 +15,7 @@ export const metadata: Metadata = {
     "ProxyHub is a modern web proxy frontend focused on speed, privacy, and unlimited access.",
 };
 
+
 export default function RootLayout({
   children,
 }: Readonly<{
