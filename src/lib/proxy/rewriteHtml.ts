@@ -68,12 +68,10 @@ function rewriteAttributeValue(val: string, base: string): string | null {
   if (skipRewrite(trimmed) || trimmed.includes("proxy?url=")) return null;
   if (isTrackingOrThirdPartyScript(trimmed)) return null;
   if (isAuthLikeEndpoint(trimmed)) return null;
-  if (/\.woff2?(?:$|\?)/i.test(trimmed)) return null;
   if (!isLikelyUrl(val)) return null;
   const abs = absUrl(trimmed, base);
   if (!abs) return null;
   if (isAuthLikeEndpoint(abs) || isTrackingOrThirdPartyScript(abs)) return null;
-  if (/\.woff2?(?:$|\?)/i.test(abs)) return null;
   return proxyParamUrl(abs, base);
 }
 

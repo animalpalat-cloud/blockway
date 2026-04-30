@@ -12,6 +12,7 @@ import { safeDocumentRefererParam } from "./browserHeaders";
 import { STRIP_FROM_RESPONSE, buildUpstreamRequestHeaders } from "./upstreamHeaders";
 import { isBlockedTarget, normalizeUrl, SESSION_COOKIE } from "./urls";
 import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
+import * as https from "https";
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 const CORS_ALLOW_METHODS = "GET, POST, HEAD";
@@ -159,10 +160,11 @@ export async function doProxy(
   );
 
   try {
-    const body =
+    const reqBody =
       method === "POST"
-        ? await request.arrayBuffer()
+        ? Buffer.from(await request.arrayBuffer())
         : undefined;
+
     if (apiLike || method === "POST") {
       // #region agent log
       fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
@@ -173,13 +175,13 @@ export async function doProxy(
           runId: "run1",
           hypothesisId: "H3",
           location: "src/lib/proxy/doProxyRequest.ts:upstreamFetch",
-          message: "about to call upstream",
+          message: "about to call RapidAPI upstream",
           data: {
             method,
             apiLike,
             url: parsed.toString().slice(0, 260),
-            hasBody: !!body,
-            bodyBytes: body ? body.byteLength : 0,
+            hasBody: !!reqBody,
+            bodyBytes: reqBody ? reqBody.length : 0,
             referer: headers.get("referer"),
             origin: headers.get("origin"),
           },
@@ -188,12 +190,59 @@ export async function doProxy(
       }).catch(() => {});
       // #endregion
     }
-    upstream = await fetch(parsed.toString(), {
-      method,
-      redirect: "follow",
-      signal:   controller.signal,
-      headers,
-      body,
+
+    // Call RapidAPI bypass-akamai-cloudflare endpoint
+    upstream = await new Promise<Response>((resolve, reject) => {
+      const rapidApiOptions = {
+        method: 'POST',
+        hostname: 'bypass-akamai-cloudflare.p.rapidapi.com',
+        port: null,
+        path: '/paid/akamai',
+        headers: {
+          'x-rapidapi-key': '1c527b6cbfmshd48e2f54850385bp1730d3jsnea2a99dd803b',
+          'x-rapidapi-host': 'bypass-akamai-cloudflare.p.rapidapi.com',
+          'Content-Type': 'application/json'
+        },
+        signal: controller.signal
+      };
+
+      const req = https.request(rapidApiOptions, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const resBody = Buffer.concat(chunks);
+          
+          // Relay the response headers from RapidAPI
+          const resHeaders = new Headers();
+          for (const [key, value] of Object.entries(res.headers)) {
+            if (value) {
+              if (Array.isArray(value)) {
+                value.forEach(v => resHeaders.append(key, v));
+              } else {
+                resHeaders.set(key, value);
+              }
+            }
+          }
+
+          // Build a Response object to remain compatible with existing logic
+          resolve(new Response(resBody, {
+            status: res.statusCode || 200,
+            headers: resHeaders
+          }));
+        });
+      });
+
+      req.on('error', (err) => reject(err));
+
+      req.write(JSON.stringify({
+        url: parsed.toString(),
+        method,
+        headers: Object.fromEntries(headers.entries()),
+        payload: reqBody ? reqBody.toString('base64') : {}, // Encode body if present
+        proxy: '',
+        impersonate: 'chrome120'
+      }));
+      req.end();
     });
   } catch (err) {
     clearTimeout(timer);
