@@ -8,12 +8,14 @@ const app  = express();
 const port = process.env.PORT || 3000;
 
 // ─── SOCKS5 / Cloudflare WARP Configuration ───────────────────────────────────
+// Using socks5h:// ensures that DNS lookups are performed on the VPS (remote),
+// which is required for bypassing many blocks.
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || 'socks5h://127.0.0.1:40000';
 
 // One reusable agent for both http and https targets
 const socksAgent = new SocksProxyAgent(SOCKS5_PROXY);
 
-console.log(`[Proxy] Routing all traffic through SOCKS5: ${SOCKS5_PROXY}`);
+console.log(`[Proxy] Routing all traffic through SOCKS5 (Remote DNS): ${SOCKS5_PROXY}`);
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.use(express.json());
@@ -76,9 +78,6 @@ app.all('/proxy', (req, res) => {
     console.log(`[Proxy] ${req.method} → ${targetUrl}`);
 
     const isHttps  = targetParsed.protocol === 'https:';
-    const driver   = isHttps ? https : http;
-    const upstream = isHttps ? https : http;
-
     const upstreamHeaders = buildUpstreamHeaders(req.headers, targetParsed);
 
     // Collect the request body (already parsed by express.raw above)
@@ -89,7 +88,7 @@ app.all('/proxy', (req, res) => {
     }
 
     const options = {
-        agent:    socksAgent,           // ← Route through Cloudflare WARP
+        agent:    socksAgent,           // ← Route through Cloudflare WARP tunnel
         method:   req.method,
         hostname: targetParsed.hostname,
         port:     targetParsed.port || (isHttps ? 443 : 80),
@@ -107,14 +106,14 @@ app.all('/proxy', (req, res) => {
             }
         }
 
-        // CORS passthrough so browser-based clients work too
+        // CORS passthrough
         outHeaders['access-control-allow-origin']  = '*';
         outHeaders['access-control-allow-methods'] = 'GET, POST, HEAD, OPTIONS, PUT, DELETE, PATCH';
         outHeaders['access-control-allow-headers'] = 'Content-Type, Authorization, Cookie, User-Agent, Accept, Accept-Language, Referer, Origin';
 
         res.writeHead(proxyRes.statusCode || 200, outHeaders);
 
-        // Stream the response body directly — no buffering needed
+        // Stream the response body directly
         proxyRes.pipe(res, { end: true });
     });
 
