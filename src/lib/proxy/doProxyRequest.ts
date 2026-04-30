@@ -14,7 +14,7 @@ import { isBlockedTarget, normalizeUrl, SESSION_COOKIE } from "./urls";
 import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
-const CORS_ALLOW_METHODS = "GET";
+const CORS_ALLOW_METHODS = "GET, POST, HEAD";
 const CORS_ALLOW_HEADERS =
   "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer";
 const CORS_EXPOSE_HEADERS =
@@ -77,7 +77,7 @@ function buildPuppeteerProxyResponse(
 export async function doProxy(
   request: NextRequest,
   targetUrlStr: string,
-  method: "GET" | "HEAD" = "GET",
+  method: "GET" | "POST" | "HEAD" = "GET",
 ): Promise<NextResponse> {
   const sessionId = getSessionId(request);
 
@@ -132,11 +132,16 @@ export async function doProxy(
   );
 
   try {
+    const body =
+      method === "POST"
+        ? await request.arrayBuffer()
+        : undefined;
     upstream = await fetch(parsed.toString(), {
       method,
       redirect: "follow",
       signal:   controller.signal,
       headers,
+      body,
     });
   } catch (err) {
     clearTimeout(timer);

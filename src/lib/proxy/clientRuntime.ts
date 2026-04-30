@@ -14,6 +14,9 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
 
   var mainLoc = window.location;
   var P = mainLoc && mainLoc.origin ? mainLoc.origin : "";
+  var pHostname = (function () {
+    try { return P ? new U0(P + "/").hostname.toLowerCase() : ""; } catch (eH0) { return ""; }
+  })();
   var Oi = (function () {
     try { return new U0(O + "/").origin; } catch (e) { return O.replace(/\\/$/, ""); }
   })();
@@ -119,6 +122,13 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         x.protocol === "http:" || x.protocol === "https:" || x.protocol === "ws:" || x.protocol === "wss:";
       if (!okP) return u;
       if (isAlreadyProxied(x.href)) return x.href;
+      // Never proxy the proxy's own host/subdomains; keep as direct same-site request.
+      try {
+        var h = (x.hostname || "").toLowerCase();
+        if (pHostname && (h === pHostname || h.endsWith("." + pHostname))) {
+          return x.href;
+        }
+      } catch (e7) {}
       return "/proxy?url=" + strictEncode(x.href) + "&ref=" + strictEncode(r);
     } catch (e6) {
       return u;

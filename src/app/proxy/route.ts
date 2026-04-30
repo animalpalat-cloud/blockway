@@ -28,15 +28,19 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const qpUrl = request.nextUrl.searchParams.get("url")?.trim() ?? "";
+  if (qpUrl) {
+    return doProxy(request, qpUrl, "POST");
+  }
   try {
-    const body   = (await request.json()) as { url?: string };
+    const body = (await request.json()) as { url?: string };
     const target = body?.url?.trim() ?? "";
     if (!target) {
       return jsonError("Missing url in JSON body.", 400);
     }
-    return doProxy(request, target, "GET");
+    return doProxy(request, target, "POST");
   } catch {
-    return jsonError("Invalid JSON body.", 400);
+    return jsonError("Missing url query parameter or valid JSON body.", 400);
   }
 }
 
