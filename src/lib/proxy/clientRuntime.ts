@@ -104,6 +104,12 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     if (u == null || u === "") return u;
     if (isSkip(String(u))) return u;
     if (isAlreadyProxied(String(u))) return u;
+    function strictEncode(v) {
+      // RFC3986-safe encoding for WAF-sensitive characters ((), [], !, ', *).
+      return encodeURIComponent(v).replace(/[!'()*\[\]]/g, function (ch) {
+        return "%" + ch.charCodeAt(0).toString(16).toUpperCase();
+      });
+    }
     var s = String(u);
     var r = mainLoc && mainLoc.href ? mainLoc.href : O + "/";
     try {
@@ -113,7 +119,7 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         x.protocol === "http:" || x.protocol === "https:" || x.protocol === "ws:" || x.protocol === "wss:";
       if (!okP) return u;
       if (isAlreadyProxied(x.href)) return x.href;
-      return "/proxy?url=" + encodeURIComponent(x.href) + "&ref=" + encodeURIComponent(r);
+      return "/proxy?url=" + strictEncode(x.href) + "&ref=" + strictEncode(r);
     } catch (e6) {
       return u;
     }
