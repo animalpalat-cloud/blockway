@@ -9,7 +9,7 @@ app.use(express.json());
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
 // RapidAPI Configuration
-const RAPIDAPI_KEY = '1c527b6cbfmshd48e2f54850385bp1730d3jsnea2a99dd803b';
+const RAPIDAPI_KEY = '9edd2be2bcmsh71a42028043951ep18be61jsnbb7b74d1937b';
 const RAPIDAPI_HOST = 'bypass-akamai-cloudflare.p.rapidapi.com';
 
 /**

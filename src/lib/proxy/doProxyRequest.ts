@@ -199,7 +199,7 @@ export async function doProxy(
         port: null,
         path: '/paid/akamai',
         headers: {
-          'x-rapidapi-key': '1c527b6cbfmshd48e2f54850385bp1730d3jsnea2a99dd803b',
+          'x-rapidapi-key': '9edd2be2bcmsh71a42028043951ep18be61jsnbb7b74d1937b',
           'x-rapidapi-host': 'bypass-akamai-cloudflare.p.rapidapi.com',
           'Content-Type': 'application/json'
         },
