@@ -1,11 +1,22 @@
 import * as cheerio from "cheerio";
 import type { CheerioAPI } from "cheerio";
+import { buildClientRuntimePatch } from "./clientRuntime";
 import { absUrl, isLikelyUrl, proxyParamUrl, skipRewrite } from "./urls";
 
 const URL_ATTRS: { sel: string; attr: string }[] = [
   { sel: "a[href]", attr: "href" },
   { sel: "img[src]", attr: "src" },
   { sel: "link[href]", attr: "href" },
+  { sel: "script[src]", attr: "src" },
+  { sel: "iframe[src]", attr: "src" },
+  { sel: "source[src]", attr: "src" },
+  { sel: "video[src]", attr: "src" },
+  { sel: "audio[src]", attr: "src" },
+  { sel: "source[srcset]", attr: "srcset" },
+  { sel: "img[srcset]", attr: "srcset" },
+  { sel: "form[action]", attr: "action" },
+  { sel: "input[formaction]", attr: "formaction" },
+  { sel: "button[formaction]", attr: "formaction" },
 ];
 
 const TRACKING_PATTERNS = [
@@ -57,6 +68,21 @@ function rewriteAttributeValue(val: string, base: string): string | null {
   return proxyParamUrl(abs, base);
 }
 
+function rewriteSrcsetValue(srcset: string, base: string): string {
+  return String(srcset)
+    .split(",")
+    .map((part) => {
+      const token = part.trim();
+      if (!token) return token;
+      const bits = token.split(/\s+/);
+      const url = bits[0] ?? "";
+      const rewritten = rewriteAttributeValue(url, base) ?? url;
+      if (bits.length <= 1) return rewritten;
+      return `${rewritten} ${bits.slice(1).join(" ")}`;
+    })
+    .join(", ");
+}
+
 /** Steps 0–7: URL rewrites, CSP metas, styles, no head injection. */
 function applyCoreRewrites($: CheerioAPI, base: string): void {
   $("meta").each((_, el) => {
@@ -76,14 +102,16 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
     'link[rel="preconnect"], link[rel=preconnect], link[rel="dns-prefetch"], link[rel=dns-prefetch], link[rel="prerender"]',
   ).remove();
   $('link[rel="manifest"], link[rel=manifest], link[rel="serviceworker"], link[rel=serviceworker]').remove();
-  $("script").remove();
-  $("iframe[src], embed[src], object[data]").remove();
-  $("form[action], input[formaction], button[formaction]").remove();
 
   for (const { sel, attr } of URL_ATTRS) {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
       if (!v) return;
+      if (attr === "srcset") {
+        const next = rewriteSrcsetValue(v, base);
+        if (next && next !== v) $(el).attr(attr, next);
+        return;
+      }
       if (sel === "link[href]") {
         const rel = String($(el).attr("rel") || "").toLowerCase();
         const isCss = rel.includes("stylesheet") || /\.css(?:$|\?)/i.test(v);
@@ -128,11 +156,11 @@ export function rewriteHtml(
   applyCoreRewrites($, base);
   rewriteInertSubfragments($, base);
 
-  const origin = new URL(base).origin;
   const headInject: string[] = [];
   if (injectClientRuntime) {
-    // Intentionally no runtime injection for static-browsing mode.
-    void origin;
+    const origin = new URL(base).origin;
+    headInject.push("<script>(function(){try{if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});}}catch(e){}})();</script>");
+    headInject.push(`<script>${buildClientRuntimePatch(origin)}</script>`);
   }
   headInject.push('<meta name="referrer" content="no-referrer">');
 
