@@ -20,6 +20,17 @@ const CORS_ALLOW_HEADERS =
 const CORS_EXPOSE_HEADERS =
   "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render";
 
+function isApiLikeRequest(request: NextRequest, target: URL): boolean {
+  const p = target.pathname.toLowerCase();
+  if (p.startsWith("/api/") || p.includes("/api/")) return true;
+  const accept = (request.headers.get("accept") || "").toLowerCase();
+  if (accept.includes("application/json")) return true;
+  const ctype = (request.headers.get("content-type") || "").toLowerCase();
+  if (ctype.includes("application/json")) return true;
+  const xhr = (request.headers.get("x-requested-with") || "").toLowerCase();
+  return xhr === "xmlhttprequest";
+}
+
 function applyCorsHeaders(headers: Headers): void {
   headers.set("access-control-allow-origin", "*");
   headers.set("access-control-allow-methods", CORS_ALLOW_METHODS);
@@ -94,6 +105,7 @@ export async function doProxy(
     request.nextUrl.searchParams.get("ref"),
   );
   const maxBytes = MAX_SIZE_MB * 1024 * 1024;
+  const apiLike = isApiLikeRequest(request, parsed);
 
   if (method === "GET" && shouldRenderHtmlWithPuppeteer(request, parsed)) {
     try {
@@ -174,8 +186,8 @@ export async function doProxy(
   const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
   const isCss = ct.includes("text/css");
   const sniffHtml =
-    isHtml ||
-    (ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
+    (!apiLike && isHtml) ||
+    (!apiLike && ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
 
   let body: Buffer = buf;
   if (hasBody && sniffHtml) {
@@ -189,9 +201,9 @@ export async function doProxy(
     }
   });
 
-  if (sniffHtml) {
+  if (!apiLike && sniffHtml) {
     resHeaders.set("content-type", "text/html; charset=utf-8");
-  } else if (isCss) {
+  } else if (!apiLike && isCss) {
     resHeaders.set("content-type", "text/css; charset=utf-8");
   }
   if (!resHeaders.get("x-proxy-render")) {

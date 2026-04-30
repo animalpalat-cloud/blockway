@@ -103,13 +103,29 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     return x;
   }
 
+  function fixProxyHostLeak(x) {
+    if (!x || !pHostname || !tHostname) return x;
+    try {
+      var h = (x.hostname || "").toLowerCase();
+      if (h === pHostname) {
+        return new U0(x.protocol + "//" + tHostname + x.pathname + x.search + (x.hash || ""));
+      }
+      if (h.endsWith("." + pHostname)) {
+        var sub = h.slice(0, h.length - pHostname.length - 1);
+        var nh = sub ? sub + "." + tHostname : tHostname;
+        return new U0(x.protocol + "//" + nh + x.pathname + x.search + (x.hash || ""));
+      }
+    } catch (eH1) {}
+    return x;
+  }
+
   function p(u) {
     if (u == null || u === "") return u;
     if (isSkip(String(u))) return u;
     if (isAlreadyProxied(String(u))) return u;
     function strictEncode(v) {
       // RFC3986-safe encoding for WAF-sensitive characters ((), [], !, ', *).
-      return encodeURIComponent(v).replace(/[!'()*\[\]]/g, function (ch) {
+      return encodeURIComponent(v).replace(/[!'()*\\[\\]]/g, function (ch) {
         return "%" + ch.charCodeAt(0).toString(16).toUpperCase();
       });
     }
@@ -118,14 +134,15 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     try {
       var x = /^[a-zA-Z][a-zA-Z+.-]*:/.test(s) ? new U0(s) : new U0(s, baseUrl());
       x = fixTargetOrMisresolvedProxyUrl(x) || x;
+      x = fixProxyHostLeak(x) || x;
       var okP =
         x.protocol === "http:" || x.protocol === "https:" || x.protocol === "ws:" || x.protocol === "wss:";
       if (!okP) return u;
       if (isAlreadyProxied(x.href)) return x.href;
-      // Never proxy the proxy's own host/subdomains; keep as direct same-site request.
+      // Keep same-host requests direct; subdomains can represent leaked target hosts and should be re-proxied.
       try {
         var h = (x.hostname || "").toLowerCase();
-        if (pHostname && (h === pHostname || h.endsWith("." + pHostname))) {
+        if (pHostname && h === pHostname) {
           return x.href;
         }
       } catch (e7) {}
