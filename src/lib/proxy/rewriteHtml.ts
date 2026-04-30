@@ -159,7 +159,7 @@ export function rewriteHtml(
   const headInject: string[] = [];
   if (injectClientRuntime) {
     const origin = new URL(base).origin;
-    headInject.push("<script>(function(){try{if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});}}catch(e){}})();</script>");
+    headInject.push("<script>(function(){if(!('serviceWorker' in navigator))return;function reg(path){return navigator.serviceWorker.register(path,{scope:'/'});}reg('/sw.js').catch(function(){return reg('/pwa.js');}).catch(function(){});})();</script>");
     headInject.push(`<script>${buildClientRuntimePatch(origin)}</script>`);
   }
   headInject.push('<meta name="referrer" content="no-referrer">');

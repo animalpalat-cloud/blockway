@@ -7,12 +7,11 @@ export default {
       return new Response("Missing ?url=", { status: 400 });
     }
 
-    let targetUrl;
-    try {
-      targetUrl = new URL(targetParam);
-    } catch {
+    const normalizedTarget = normalizeTargetParam(targetParam);
+    if (!normalizedTarget) {
       return new Response("Invalid target URL", { status: 400 });
     }
+    const targetUrl = normalizedTarget;
 
     const normalizedReferer = safeHttpUrl(refParam) || `${targetUrl.origin}/`;
     const refererUrl = new URL(normalizedReferer);
@@ -48,6 +47,13 @@ export default {
     const responseHeaders = new Headers(upstream.headers);
     responseHeaders.delete("content-length");
     responseHeaders.delete("content-encoding");
+    responseHeaders.delete("content-security-policy");
+    responseHeaders.delete("content-security-policy-report-only");
+    responseHeaders.delete("x-frame-options");
+    responseHeaders.delete("frame-options");
+    responseHeaders.delete("cross-origin-opener-policy");
+    responseHeaders.delete("cross-origin-embedder-policy");
+    responseHeaders.delete("cross-origin-resource-policy");
     responseHeaders.set("x-proxy-upstream", targetUrl.origin);
 
     // Stream body directly to client to support large MP4/HLS segment traffic.
@@ -58,6 +64,29 @@ export default {
     });
   },
 };
+
+function normalizeTargetParam(raw) {
+  if (!raw) return null;
+  const seen = new Set();
+  let cur = String(raw).trim();
+  if (!cur) return null;
+
+  // Handle double-encoded query values from nested proxy hops.
+  for (let i = 0; i < 4; i += 1) {
+    if (seen.has(cur)) break;
+    seen.add(cur);
+    const candidate = safeHttpUrl(cur);
+    if (candidate) return new URL(candidate);
+    try {
+      const decoded = decodeURIComponent(cur);
+      if (decoded === cur) break;
+      cur = decoded.trim();
+    } catch {
+      break;
+    }
+  }
+  return null;
+}
 
 function safeHttpUrl(value) {
   if (!value) return null;
@@ -75,10 +104,15 @@ function stripProxyIdentityHeaders(headers) {
     "host",
     "origin",
     "referer",
+    "forwarded",
     "cf-connecting-ip",
+    "cf-ew-via",
+    "cf-worker",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-server",
     "x-real-ip",
     "true-client-ip",
     "cdn-loop",
