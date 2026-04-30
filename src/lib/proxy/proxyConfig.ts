@@ -6,7 +6,7 @@ export const PROXY_PUPPETEER_TIMEOUT_MS =
 export const PROXY_PUPPETEER_SETTLE_MS =
   Number(process.env.PROXY_PUPPETEER_SETTLE_MS) || 1_500;
 export const MAX_SIZE_MB = Number(process.env.PROXY_MAX_SIZE_MB) || 32;
-export const SOCKS5_PROXY = process.env.SOCKS5_PROXY || 'socks5://127.0.0.1:40000';
+export const SOCKS5_PROXY = process.env.SOCKS5_PROXY || 'socks5h://127.0.0.1:40000';
 
 /** "0" disables the Puppeteer path entirely. */
 export const PROXY_PUPPETEER_ENABLED = process.env.PROXY_PUPPETEER !== "0";

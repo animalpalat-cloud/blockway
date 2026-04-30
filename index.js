@@ -8,7 +8,7 @@ const app  = express();
 const port = process.env.PORT || 3000;
 
 // ─── SOCKS5 / Cloudflare WARP Configuration ───────────────────────────────────
-const SOCKS5_PROXY = process.env.SOCKS5_PROXY || 'socks5://127.0.0.1:40000';
+const SOCKS5_PROXY = process.env.SOCKS5_PROXY || 'socks5h://127.0.0.1:40000';
 
 // One reusable agent for both http and https targets
 const socksAgent = new SocksProxyAgent(SOCKS5_PROXY);
