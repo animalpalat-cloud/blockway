@@ -170,7 +170,7 @@ export async function doProxy(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
 
-  let upstream: Response;
+  let upstream: { status: number, headers: Headers, body: Buffer, url: string };
   const headers = buildUpstreamRequestHeaders(
     request.headers,
     parsed,
@@ -210,7 +210,7 @@ export async function doProxy(
     }
 
     // Call target directly via SOCKS5 proxy
-    upstream = await new Promise<Response>((resolve, reject) => {
+    upstream = await new Promise((resolve, reject) => {
       const isTargetHttps = parsed.protocol === 'https:';
       const requestModule = isTargetHttps ? https : http;
       
@@ -242,11 +242,12 @@ export async function doProxy(
             }
           }
 
-          // Build a Response object to remain compatible with existing logic
-          resolve(new Response(resBody, {
+          resolve({
             status: res.statusCode || 200,
-            headers: resHeaders
-          }));
+            headers: resHeaders,
+            body: resBody,
+            url: parsed.toString()
+          });
         });
       });
 
@@ -278,9 +279,7 @@ export async function doProxy(
   const finalUrl = upstream.url || parsed.toString();
   const encoding = upstream.headers.get("content-encoding");
   const hasBody = method !== "HEAD";
-  const rawBuf = hasBody
-    ? Buffer.from(await upstream.arrayBuffer())
-    : Buffer.alloc(0);
+  const rawBuf = hasBody ? upstream.body : Buffer.alloc(0);
 
   // Decompress before processing strings
   const buf = decompress(rawBuf, encoding);
