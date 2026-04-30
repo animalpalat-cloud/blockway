@@ -5,6 +5,7 @@ import {
   inferResourceKind,
   pickAcceptLanguage,
   pickUserAgentForUpstream,
+  pickSecChUa,
   DEFAULT_ACCEPT_ENCODING,
 } from "./browserHeaders";
 import { cookieHeaderForHost } from "./cookieJar";
@@ -86,6 +87,10 @@ export function buildUpstreamRequestHeaders(
   out.set("accept", buildAcceptForKind(kind));
   out.set("accept-language", pickAcceptLanguage());
   out.set("accept-encoding", DEFAULT_ACCEPT_ENCODING);
+
+  const ua = out.get("user-agent") || "";
+  const ch = pickSecChUa(ua);
+  Object.entries(ch).forEach(([k, v]) => out.set(k, v));
 
   const { referer, origin } = buildRefererAndOrigin(target, ref);
   out.set("referer", referer);

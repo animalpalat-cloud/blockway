@@ -26,6 +26,8 @@ const URL_ATTRS: { sel: string; attr: string }[] = [
   { sel: "form[action]", attr: "action" },
   { sel: "input[formaction]", attr: "formaction" },
   { sel: "button[formaction]", attr: "formaction" },
+  { sel: "use[href]", attr: "href" },
+  { sel: "use[xlink\\:href]", attr: "xlink:href" },
 ];
 
 const TRACKING_PATTERNS = [

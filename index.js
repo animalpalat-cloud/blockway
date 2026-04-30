@@ -16,7 +16,6 @@ const socksAgent = new SocksProxyAgent(SOCKS5_PROXY);
 console.log(`[Proxy] Routing all traffic through SOCKS5 (Remote DNS): ${SOCKS5_PROXY}`);
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
-app.use(express.json());
 app.use(express.raw({ type: '*/*', limit: '30mb' })); // Higher limit for heavy sites
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
@@ -108,14 +107,28 @@ function rewriteHtml(html, base, reqHost) {
     $('head').prepend(`<script>${buildClientRuntime(targetOrigin, proxyBase)}</script>`);
     $('head').prepend('<meta name="referrer" content="no-referrer">');
 
-    const tags = {
-        'a': 'href', 'link': 'href', 'img': 'src', 'script': 'src',
-        'iframe': 'src', 'form': 'action', 'source': 'src',
-        'video': 'src', 'audio': 'src', 'track': 'src', 'embed': 'src'
-    };
+    const tags = [
+        { sel: 'a', attr: 'href' },
+        { sel: 'link', attr: 'href' },
+        { sel: 'img', attr: 'src' },
+        { sel: 'script', attr: 'src' },
+        { sel: 'iframe', attr: 'src' },
+        { sel: 'form', attr: 'action' },
+        { sel: 'source', attr: 'src' },
+        { sel: 'video', attr: 'src' },
+        { sel: 'video', attr: 'poster' },
+        { sel: 'audio', attr: 'src' },
+        { sel: 'track', attr: 'src' },
+        { sel: 'embed', attr: 'src' },
+        { sel: 'object', attr: 'data' },
+        { sel: 'use', attr: 'href' },
+        { sel: 'use', attr: 'xlink:href' },
+        { sel: 'image', attr: 'href' },
+        { sel: 'image', attr: 'xlink:href' }
+    ];
 
-    Object.entries(tags).forEach(([tag, attr]) => {
-        $(tag).each((_, el) => {
+    tags.forEach(({ sel, attr }) => {
+        $(sel).each((_, el) => {
             const val = $(el).attr(attr);
             if (val) $(el).attr(attr, proxyUrl(val, base, reqHost));
             
@@ -123,8 +136,10 @@ function rewriteHtml(html, base, reqHost) {
             const srcset = $(el).attr('srcset');
             if (srcset) {
                 const rewritten = srcset.split(',').map(part => {
-                    const [u, q] = part.trim().split(/\s+/);
-                    return q ? `${proxyUrl(u, base, reqHost)} ${q}` : proxyUrl(u, base, reqHost);
+                    const bits = part.trim().split(/\s+/);
+                    if (!bits[0]) return part;
+                    bits[0] = proxyUrl(bits[0], base, reqHost);
+                    return bits.join(' ');
                 }).join(', ');
                 $(el).attr('srcset', rewritten);
             }
@@ -149,6 +164,63 @@ function rewriteHtml(html, base, reqHost) {
 }
 
 // ─── Proxy Handler ─────────────────────────────────────────────────────────────
+const CHROME_LIKE_UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+];
+
+const INCOMING_STRIP = new Set([
+    "user-agent", "accept", "accept-language", "accept-encoding", "referer", "origin",
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "host", "connection"
+]);
+
+function buildSpoofedHeaders(incoming, targetUrl, ref) {
+    const target = new url.URL(targetUrl);
+    const out = {};
+    
+    // 1. Pass through safe headers
+    Object.entries(incoming).forEach(([k, v]) => {
+        if (!INCOMING_STRIP.has(k.toLowerCase())) out[k] = v;
+    });
+
+    // 2. Rotate User-Agent
+    const ua = CHROME_LIKE_UAS[Math.floor(Math.random() * CHROME_LIKE_UAS.length)];
+    out['user-agent'] = ua;
+
+    // 3. Realistic Accept/Language
+    out['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
+    out['accept-language'] = 'en-US,en;q=0.9';
+    out['accept-encoding'] = 'identity';
+
+    // 4. Sec-Ch-Ua
+    const version = ua.match(/Chrome\/(\d+)/)[1];
+    out['sec-ch-ua'] = `"Not A(Brand";v="99", "Google Chrome";v="${version}", "Chromium";v="${version}"`;
+    out['sec-ch-ua-mobile'] = '?0';
+    out['sec-ch-ua-platform'] = ua.includes('Windows') ? '"Windows"' : ua.includes('Mac') ? '"macOS"' : '"Linux"';
+
+    // 5. Referer & Origin
+    // If 'ref' is provided (original page URL), use its origin. Else use target origin.
+    let baseRef = target.origin + '/';
+    if (ref) {
+        try { baseRef = new url.URL(ref).origin + '/'; } catch(e) {}
+    }
+    out['referer'] = baseRef;
+    out['origin'] = target.origin;
+
+    // 6. Sec-Fetch
+    out['sec-fetch-dest'] = 'document';
+    out['sec-fetch-mode'] = 'navigate';
+    out['sec-fetch-site'] = 'none';
+    out['sec-fetch-user'] = '?1';
+    
+    return out;
+}
+
+// ─── Proxy Handler ─────────────────────────────────────────────────────────────
 app.all(PROXY_PATH, (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).json({ error: 'Missing ?url= query parameter.' });
@@ -162,13 +234,12 @@ app.all(PROXY_PATH, (req, res) => {
 
     const reqHost = req.headers.host;
     const isHttps = targetParsed.protocol === 'https:';
-    const upstreamHeaders = { ...req.headers };
     
-    delete upstreamHeaders['host'];
-    delete upstreamHeaders['connection'];
-    upstreamHeaders['accept-encoding'] = 'identity'; 
-
+    // Apply Header Spoofing
+    const upstreamHeaders = buildSpoofedHeaders(req.headers, targetUrl, req.query.ref);
+    
     const body = req.body && req.body.length > 0 ? req.body : null;
+    if (body) upstreamHeaders['content-length'] = body.length;
 
     const options = {
         agent:    socksAgent,

@@ -150,7 +150,7 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         if (
           pHostname &&
           h === pHostname &&
-          (/^\\/proxy(?:\/|$)/.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 || x.pathname === "/sw.js" || x.pathname === "/pwa.js")
+          (/^\\\/proxy(?:\\\/|$)/.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 || x.pathname === "/sw.js" || x.pathname === "/pwa.js")
         ) {
           // #region agent log
           fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451",{method:"POST",headers:{"Content-Type":"application/json","X-Debug-Session-Id":"caef94"},body:JSON.stringify({sessionId:"caef94",runId:"run1",hypothesisId:"H5",location:"src/lib/proxy/clientRuntime.ts:p",message:"same-host URL bypassed proxy rewrite",data:{input:String(u).slice(0,220),resolved:x.href.slice(0,220)},timestamp:Date.now()})}).catch(function(){});

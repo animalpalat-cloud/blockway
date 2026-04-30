@@ -58,6 +58,25 @@ export function pickUserAgentForUpstream(): string {
   return CHROME_LIKE_UAS[i] ?? CHROME_LIKE_UAS[0]!;
 }
 
+/**
+ * Generates Sec-Ch-Ua headers matching the selected User-Agent.
+ */
+export function pickSecChUa(ua: string): Record<string, string> {
+  const isEdge = ua.includes("Edg/");
+  const m = ua.match(/Chrome\/(\d+)/);
+  const version = m ? m[1] : "131";
+  
+  const brands = isEdge 
+    ? `"Not A(Brand";v="99", "Microsoft Edge";v="${version}", "Chromium";v="${version}"`
+    : `"Not A(Brand";v="99", "Google Chrome";v="${version}", "Chromium";v="${version}"`;
+
+  return {
+    "sec-ch-ua": brands,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": ua.includes("Windows") ? '"Windows"' : ua.includes("Mac") ? '"macOS"' : '"Linux"'
+  };
+}
+
 function pathNameLower(target: URL): string {
   let p: string;
   try {
