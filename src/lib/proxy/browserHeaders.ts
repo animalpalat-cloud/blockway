@@ -195,7 +195,7 @@ export function pickAcceptLanguage(): string {
   return ACCEPT_LANG_POOL[Math.floor(rng() * ACCEPT_LANG_POOL.length)] ?? ACCEPT_LANG_POOL[0]!;
 }
 
-export const DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br";
+export const DEFAULT_ACCEPT_ENCODING = "identity";
 
 /** Validated `ref` query value for `/proxy?url=...&ref=...` (parent document URL). */
 export function safeDocumentRefererParam(raw: string | null | undefined): string | null {

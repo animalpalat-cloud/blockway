@@ -18,6 +18,20 @@ import { SocksProxyAgent } from "socks-proxy-agent";
 
 const socksAgent = new SocksProxyAgent(SOCKS5_PROXY);
 
+import * as zlib from "zlib";
+
+function decompress(buffer: Buffer, encoding: string | null): Buffer {
+  if (!encoding) return buffer;
+  try {
+    if (encoding.includes("gzip")) return zlib.gunzipSync(buffer);
+    if (encoding.includes("deflate")) return zlib.inflateSync(buffer);
+    if (encoding.includes("br")) return zlib.brotliDecompressSync(buffer);
+  } catch (err) {
+    console.error("[proxy] Decompression failed:", err instanceof Error ? err.message : err);
+  }
+  return buffer;
+}
+
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 const CORS_ALLOW_METHODS = "GET, POST, HEAD";
 const CORS_ALLOW_HEADERS =
@@ -262,10 +276,15 @@ export async function doProxy(
 
   const contentType = upstream.headers.get("content-type") ?? "application/octet-stream";
   const finalUrl = upstream.url || parsed.toString();
+  const encoding = upstream.headers.get("content-encoding");
   const hasBody = method !== "HEAD";
-  const buf = hasBody
+  const rawBuf = hasBody
     ? Buffer.from(await upstream.arrayBuffer())
     : Buffer.alloc(0);
+
+  // Decompress before processing strings
+  const buf = decompress(rawBuf, encoding);
+
   if (buf.length > maxBytes) {
     return json("Response too large.", 413, sessionId);
   }
@@ -273,36 +292,26 @@ export async function doProxy(
   const ct = contentType.toLowerCase();
   const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
   const isCss = ct.includes("text/css");
-  if (isCss) {
-    const cssProbe = buf.toString("utf-8", 0, Math.min(buf.length, 8_192));
-    if (/url\((["']?)\/(?:icons|xh-desktop|flags)[^)]*\)/i.test(cssProbe)) {
-      // #region agent log
-      fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
-        body: JSON.stringify({
-          sessionId: "caef94",
-          runId: "run1",
-          hypothesisId: "H2",
-          location: "src/lib/proxy/doProxyRequest.ts:cssProbe",
-          message: "css contains root-relative asset URLs",
-          data: { finalUrl: finalUrl.slice(0, 260), cssSample: cssProbe.slice(0, 320) },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {});
-      // #endregion
-    }
-  }
+  const isJs = ct.includes("javascript") || ct.includes("application/x-javascript");
+
+  // Only attempt to process as string if it's a known text type
   const sniffHtml =
     (!apiLike && isHtml) ||
     (!apiLike && ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
 
   let body: Buffer = buf;
   if (hasBody && sniffHtml) {
-    body = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true), "utf-8");
+    try {
+      body = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true), "utf-8");
+    } catch (err) {
+      console.error("[proxy] HTML rewrite failed:", err);
+    }
   } else if (hasBody && isCss) {
-    // Rewrite root-relative CSS asset URLs so they stay inside /proxy routing.
-    body = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
+    try {
+      body = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
+    } catch (err) {
+      console.error("[proxy] CSS rewrite failed:", err);
+    }
   }
   if (apiLike && upstream.status >= 400) {
     // #region agent log
