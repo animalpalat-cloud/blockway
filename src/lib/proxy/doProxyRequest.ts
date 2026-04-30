@@ -94,6 +94,21 @@ export async function doProxy(
 
   const parsed = normalizeUrl(targetUrlStr);
   if (!parsed) {
+    // #region agent log
+    fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
+      body: JSON.stringify({
+        sessionId: "caef94",
+        runId: "run1",
+        hypothesisId: "H1",
+        location: "src/lib/proxy/doProxyRequest.ts:doProxy",
+        message: "normalizeUrl returned null",
+        data: { targetUrlStrSample: String(targetUrlStr).slice(0, 260), method },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     return json("Invalid URL.", 400, sessionId);
   }
   if (isBlockedTarget(parsed)) {
@@ -148,6 +163,31 @@ export async function doProxy(
       method === "POST"
         ? await request.arrayBuffer()
         : undefined;
+    if (apiLike || method === "POST") {
+      // #region agent log
+      fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
+        body: JSON.stringify({
+          sessionId: "caef94",
+          runId: "run1",
+          hypothesisId: "H3",
+          location: "src/lib/proxy/doProxyRequest.ts:upstreamFetch",
+          message: "about to call upstream",
+          data: {
+            method,
+            apiLike,
+            url: parsed.toString().slice(0, 260),
+            hasBody: !!body,
+            bodyBytes: body ? body.byteLength : 0,
+            referer: headers.get("referer"),
+            origin: headers.get("origin"),
+          },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
+    }
     upstream = await fetch(parsed.toString(), {
       method,
       redirect: "follow",
@@ -185,6 +225,26 @@ export async function doProxy(
   const ct = contentType.toLowerCase();
   const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
   const isCss = ct.includes("text/css");
+  if (isCss) {
+    const cssProbe = buf.toString("utf-8", 0, Math.min(buf.length, 8_192));
+    if (/url\((["']?)\/(?:icons|xh-desktop|flags)[^)]*\)/i.test(cssProbe)) {
+      // #region agent log
+      fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
+        body: JSON.stringify({
+          sessionId: "caef94",
+          runId: "run1",
+          hypothesisId: "H2",
+          location: "src/lib/proxy/doProxyRequest.ts:cssProbe",
+          message: "css contains root-relative asset URLs",
+          data: { finalUrl: finalUrl.slice(0, 260), cssSample: cssProbe.slice(0, 320) },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
+    }
+  }
   const sniffHtml =
     (!apiLike && isHtml) ||
     (!apiLike && ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
@@ -192,6 +252,31 @@ export async function doProxy(
   let body: Buffer = buf;
   if (hasBody && sniffHtml) {
     body = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true), "utf-8");
+  } else if (hasBody && isCss) {
+    // Rewrite root-relative CSS asset URLs so they stay inside /proxy routing.
+    body = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
+  }
+  if (apiLike && upstream.status >= 400) {
+    // #region agent log
+    fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
+      body: JSON.stringify({
+        sessionId: "caef94",
+        runId: "run1",
+        hypothesisId: "H4",
+        location: "src/lib/proxy/doProxyRequest.ts:apiError",
+        message: "api-like upstream returned error",
+        data: {
+          status: upstream.status,
+          contentType: contentType.slice(0, 120),
+          finalUrl: finalUrl.slice(0, 260),
+          bodySample: buf.toString("utf-8", 0, 320),
+        },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
   }
 
   const resHeaders = new Headers();

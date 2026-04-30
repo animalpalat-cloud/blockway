@@ -125,9 +125,13 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     if (isAlreadyProxied(String(u))) return u;
     function strictEncode(v) {
       // RFC3986-safe encoding for WAF-sensitive characters ((), [], !, ', *).
-      return encodeURIComponent(v).replace(/[!'()*\\[\\]]/g, function (ch) {
-        return "%" + ch.charCodeAt(0).toString(16).toUpperCase();
-      });
+      return encodeURIComponent(v)
+        .replace(/[!'*\\[\\]]/g, function (ch) {
+          return "%" + ch.charCodeAt(0).toString(16).toUpperCase();
+        })
+        // Keep these explicit so runtime string-escaping cannot regress bracket/paren encoding.
+        .replace(/\(/g, "%28")
+        .replace(/\)/g, "%29");
     }
     var s = String(u);
     var r = mainLoc && mainLoc.href ? mainLoc.href : O + "/";
@@ -139,13 +143,25 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         x.protocol === "http:" || x.protocol === "https:" || x.protocol === "ws:" || x.protocol === "wss:";
       if (!okP) return u;
       if (isAlreadyProxied(x.href)) return x.href;
-      // Keep same-host requests direct; subdomains can represent leaked target hosts and should be re-proxied.
+      // Keep only internal proxy/runtime endpoints direct on proxy host.
       try {
         var h = (x.hostname || "").toLowerCase();
-        if (pHostname && h === pHostname) {
+        if (
+          pHostname &&
+          h === pHostname &&
+          (/^\/(?:proxy|api)(?:\/|$)/.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 || x.pathname === "/sw.js" || x.pathname === "/pwa.js")
+        ) {
+          // #region agent log
+          fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451",{method:"POST",headers:{"Content-Type":"application/json","X-Debug-Session-Id":"caef94"},body:JSON.stringify({sessionId:"caef94",runId:"run1",hypothesisId:"H5",location:"src/lib/proxy/clientRuntime.ts:p",message:"same-host URL bypassed proxy rewrite",data:{input:String(u).slice(0,220),resolved:x.href.slice(0,220)},timestamp:Date.now()})}).catch(function(){});
+          // #endregion
           return x.href;
         }
       } catch (e7) {}
+      if (/[()\[\]]/.test(x.href)) {
+        // #region agent log
+        fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451",{method:"POST",headers:{"Content-Type":"application/json","X-Debug-Session-Id":"caef94"},body:JSON.stringify({sessionId:"caef94",runId:"run1",hypothesisId:"H1",location:"src/lib/proxy/clientRuntime.ts:p",message:"proxy URL candidate has bracket/parenthesis chars",data:{resolved:x.href.slice(0,220),ref:r.slice(0,220)},timestamp:Date.now()})}).catch(function(){});
+        // #endregion
+      }
       return "/proxy?url=" + strictEncode(x.href) + "&ref=" + strictEncode(r);
     } catch (e6) {
       return u;
@@ -173,9 +189,29 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     // keep native URL; p() and fetch still cover most cases
   }
 
+  function splitSrcsetCandidates(value) {
+    var out = [];
+    var cur = "";
+    var depth = 0;
+    var i = 0;
+    var ch = "";
+    for (i = 0; i < value.length; i++) {
+      ch = value.charAt(i);
+      if (ch === "(") depth++;
+      else if (ch === ")" && depth > 0) depth--;
+      if (ch === "," && depth === 0) {
+        out.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur) out.push(cur);
+    return out;
+  }
+
   function srcsetP(v) {
-    return String(v)
-      .split(",")
+    return splitSrcsetCandidates(String(v))
       .map(function (part) {
         var a = part.trim().split(/\\s+/);
         var u0 = a[0];

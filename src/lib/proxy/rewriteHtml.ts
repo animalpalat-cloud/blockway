@@ -78,8 +78,25 @@ function rewriteAttributeValue(val: string, base: string): string | null {
 }
 
 function rewriteSrcsetValue(srcset: string, base: string): string {
-  return String(srcset)
-    .split(",")
+  const splitCandidates = (value: string): string[] => {
+    const out: string[] = [];
+    let cur = "";
+    let depth = 0;
+    for (const ch of value) {
+      if (ch === "(") depth += 1;
+      else if (ch === ")" && depth > 0) depth -= 1;
+      if (ch === "," && depth === 0) {
+        out.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur) out.push(cur);
+    return out;
+  };
+
+  return splitCandidates(String(srcset))
     .map((part) => {
       const token = part.trim();
       if (!token) return token;
