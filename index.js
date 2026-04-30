@@ -1,96 +1,165 @@
 const express = require('express');
-const https = require('https');
-const url = require('url');
-const app = express();
+const https   = require('https');
+const http    = require('http');
+const url     = require('url');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+
+const app  = express();
 const port = process.env.PORT || 3000;
 
-// Middleware to parse JSON and raw bodies
+// ─── SOCKS5 / Cloudflare WARP Configuration ───────────────────────────────────
+const SOCKS5_PROXY = process.env.SOCKS5_PROXY || 'socks5://127.0.0.1:40000';
+
+// One reusable agent for both http and https targets
+const socksAgent = new SocksProxyAgent(SOCKS5_PROXY);
+
+console.log(`[Proxy] Routing all traffic through SOCKS5: ${SOCKS5_PROXY}`);
+
+// ─── Middleware ────────────────────────────────────────────────────────────────
 app.use(express.json());
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
-// RapidAPI Configuration
-const RAPIDAPI_KEY = '9edd2be2bcmsh71a42028043951ep18be61jsnbb7b74d1937b';
-const RAPIDAPI_HOST = 'bypass-akamai-cloudflare.p.rapidapi.com';
+// ─── Headers that must NOT be forwarded to the target ─────────────────────────
+const HOP_BY_HOP_HEADERS = new Set([
+    'host',
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailers',
+    'transfer-encoding',
+    'upgrade',
+]);
+
+// ─── Headers we must NOT relay back to the browser ────────────────────────────
+const STRIP_FROM_RESPONSE = new Set([
+    'content-encoding',
+    'content-length',
+    'transfer-encoding',
+    'connection',
+    'keep-alive',
+]);
 
 /**
- * Custom Request Handler / Proxy Gateway
+ * Build the outgoing header set:
+ * - Strips hop-by-hop headers.
+ * - Replaces `host` with the target host.
+ * - Preserves User-Agent, Cookie, Accept-Language, etc. from the client.
  */
-app.all('/proxy', async (req, res) => {
+function buildUpstreamHeaders(incomingHeaders, targetParsed) {
+    const out = {};
+    for (const [key, value] of Object.entries(incomingHeaders)) {
+        if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+            out[key] = value;
+        }
+    }
+    // Always set the correct Host for the target
+    out['host'] = targetParsed.hostname;
+    return out;
+}
+
+// ─── Universal Proxy Handler ───────────────────────────────────────────────────
+app.all('/proxy', (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) {
-        return res.status(400).json({ error: 'Missing url query parameter.' });
+        return res.status(400).json({ error: 'Missing ?url= query parameter.' });
     }
 
-    console.log(`[Proxy] Handling ${req.method} request to: ${targetUrl}`);
-
+    let targetParsed;
     try {
-        const parsedUrl = new url.URL(targetUrl);
-        
-        // Prepare headers to forward to the target
-        const headersToForward = { ...req.headers };
-        delete headersToForward['host'];
-        delete headersToForward['x-rapidapi-key'];
-        delete headersToForward['x-rapidapi-host'];
-
-        // Prepare the RapidAPI request payload
-        const rapidApiPayload = {
-            url: targetUrl,
-            method: req.method,
-            headers: headersToForward,
-            payload: req.body && Object.keys(req.body).length > 0 ? req.body : {},
-            proxy: '',
-            impersonate: 'chrome120'
-        };
-
-        const options = {
-            method: 'POST',
-            hostname: RAPIDAPI_HOST,
-            port: null,
-            path: '/paid/akamai',
-            headers: {
-                'x-rapidapi-key': RAPIDAPI_KEY,
-                'x-rapidapi-host': RAPIDAPI_HOST,
-                'Content-Type': 'application/json'
-            }
-        };
-
-        const proxyReq = https.request(options, (proxyRes) => {
-            const chunks = [];
-            proxyRes.on('data', (chunk) => chunks.push(chunk));
-            proxyRes.on('end', () => {
-                const responseBody = Buffer.concat(chunks);
-
-                // Relay response headers and cookies
-                Object.entries(proxyRes.headers).forEach(([key, value]) => {
-                    // Skip certain headers that might interfere with the client
-                    if (['content-encoding', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) return;
-                    res.setHeader(key, value);
-                });
-
-                res.status(proxyRes.statusCode || 200).send(responseBody);
-            });
-        });
-
-        proxyReq.on('error', (err) => {
-            console.error('[Proxy Error]', err);
-            res.status(502).json({ error: 'Failed to reach RapidAPI gateway.', details: err.message });
-        });
-
-        proxyReq.write(JSON.stringify(rapidApiPayload));
-        proxyReq.end();
-
-    } catch (err) {
-        console.error('[URL Error]', err);
-        res.status(400).json({ error: 'Invalid target URL.' });
+        targetParsed = new url.URL(targetUrl);
+    } catch {
+        return res.status(400).json({ error: 'Invalid target URL.' });
     }
+
+    console.log(`[Proxy] ${req.method} → ${targetUrl}`);
+
+    const isHttps  = targetParsed.protocol === 'https:';
+    const driver   = isHttps ? https : http;
+    const upstream = isHttps ? https : http;
+
+    const upstreamHeaders = buildUpstreamHeaders(req.headers, targetParsed);
+
+    // Collect the request body (already parsed by express.raw above)
+    const body = req.body && req.body.length > 0 ? req.body : null;
+
+    if (body) {
+        upstreamHeaders['content-length'] = Buffer.byteLength(body).toString();
+    }
+
+    const options = {
+        agent:    socksAgent,           // ← Route through Cloudflare WARP
+        method:   req.method,
+        hostname: targetParsed.hostname,
+        port:     targetParsed.port || (isHttps ? 443 : 80),
+        path:     targetParsed.pathname + targetParsed.search,
+        headers:  upstreamHeaders,
+        timeout:  30_000,
+    };
+
+    const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
+        // Relay status and safe headers back to the browser
+        const outHeaders = {};
+        for (const [key, value] of Object.entries(proxyRes.headers)) {
+            if (!STRIP_FROM_RESPONSE.has(key.toLowerCase())) {
+                outHeaders[key] = value;
+            }
+        }
+
+        // CORS passthrough so browser-based clients work too
+        outHeaders['access-control-allow-origin']  = '*';
+        outHeaders['access-control-allow-methods'] = 'GET, POST, HEAD, OPTIONS, PUT, DELETE, PATCH';
+        outHeaders['access-control-allow-headers'] = 'Content-Type, Authorization, Cookie, User-Agent, Accept, Accept-Language, Referer, Origin';
+
+        res.writeHead(proxyRes.statusCode || 200, outHeaders);
+
+        // Stream the response body directly — no buffering needed
+        proxyRes.pipe(res, { end: true });
+    });
+
+    proxyReq.on('timeout', () => {
+        proxyReq.destroy();
+        if (!res.headersSent) {
+            res.status(504).json({ error: 'Gateway timeout reaching target.' });
+        }
+    });
+
+    proxyReq.on('error', (err) => {
+        console.error('[Proxy Error]', err.message);
+        if (!res.headersSent) {
+            res.status(502).json({ error: 'Failed to reach target.', details: err.message });
+        }
+    });
+
+    if (body) {
+        proxyReq.write(body);
+    }
+    proxyReq.end();
 });
 
-// Simple health check
+// ─── OPTIONS pre-flight (CORS) ────────────────────────────────────────────────
+app.options('/proxy', (req, res) => {
+    res.set({
+        'access-control-allow-origin':  '*',
+        'access-control-allow-methods': 'GET, POST, HEAD, OPTIONS, PUT, DELETE, PATCH',
+        'access-control-allow-headers': 'Content-Type, Authorization, Cookie, User-Agent, Accept, Accept-Language, Referer, Origin',
+        'access-control-max-age':       '86400',
+    }).sendStatus(204);
+});
+
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-    res.send('Blockway Custom Proxy Gateway is running.');
+    res.json({
+        status:  'running',
+        gateway: 'Blockway SOCKS5 Proxy Gateway',
+        warp:    SOCKS5_PROXY,
+        usage:   `GET /proxy?url=https://example.com`,
+    });
 });
 
+// ─── Start server ─────────────────────────────────────────────────────────────
 app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-    console.log(`Proxy endpoint: http://localhost:${port}/proxy?url=TARGET_URL`);
+    console.log(`[Server] Running on port ${port}`);
+    console.log(`[Server] Proxy endpoint: http://localhost:${port}/proxy?url=<TARGET_URL>`);
 });

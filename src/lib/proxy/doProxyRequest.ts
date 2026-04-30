@@ -11,8 +11,12 @@ import { renderWithPuppeteer } from "./puppeteerRender";
 import { safeDocumentRefererParam } from "./browserHeaders";
 import { STRIP_FROM_RESPONSE, buildUpstreamRequestHeaders } from "./upstreamHeaders";
 import { isBlockedTarget, normalizeUrl, SESSION_COOKIE } from "./urls";
-import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
+import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, SOCKS5_PROXY, shouldRenderHtmlWithPuppeteer } from "./proxyConfig";
 import * as https from "https";
+import * as http from "http";
+import { SocksProxyAgent } from "socks-proxy-agent";
+
+const socksAgent = new SocksProxyAgent(SOCKS5_PROXY);
 
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 const CORS_ALLOW_METHODS = "GET, POST, HEAD";
@@ -175,7 +179,7 @@ export async function doProxy(
           runId: "run1",
           hypothesisId: "H3",
           location: "src/lib/proxy/doProxyRequest.ts:upstreamFetch",
-          message: "about to call RapidAPI upstream",
+          message: "about to call target via SOCKS5 proxy",
           data: {
             method,
             apiLike,
@@ -191,28 +195,28 @@ export async function doProxy(
       // #endregion
     }
 
-    // Call RapidAPI bypass-akamai-cloudflare endpoint
+    // Call target directly via SOCKS5 proxy
     upstream = await new Promise<Response>((resolve, reject) => {
-      const rapidApiOptions = {
-        method: 'POST',
-        hostname: 'bypass-akamai-cloudflare.p.rapidapi.com',
-        port: null,
-        path: '/paid/akamai',
-        headers: {
-          'x-rapidapi-key': '9edd2be2bcmsh71a42028043951ep18be61jsnbb7b74d1937b',
-          'x-rapidapi-host': 'bypass-akamai-cloudflare.p.rapidapi.com',
-          'Content-Type': 'application/json'
-        },
+      const isTargetHttps = parsed.protocol === 'https:';
+      const requestModule = isTargetHttps ? https : http;
+      
+      const proxyOptions = {
+        method: method,
+        hostname: parsed.hostname,
+        port: parsed.port || (isTargetHttps ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        headers: Object.fromEntries(headers.entries()),
+        agent: socksAgent,
         signal: controller.signal
       };
 
-      const req = https.request(rapidApiOptions, (res) => {
+      const req = requestModule.request(proxyOptions, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
           const resBody = Buffer.concat(chunks);
           
-          // Relay the response headers from RapidAPI
+          // Relay the response headers
           const resHeaders = new Headers();
           for (const [key, value] of Object.entries(res.headers)) {
             if (value) {
@@ -234,14 +238,9 @@ export async function doProxy(
 
       req.on('error', (err) => reject(err));
 
-      req.write(JSON.stringify({
-        url: parsed.toString(),
-        method,
-        headers: Object.fromEntries(headers.entries()),
-        payload: reqBody ? reqBody.toString('base64') : {}, // Encode body if present
-        proxy: '',
-        impersonate: 'chrome120'
-      }));
+      if (reqBody) {
+        req.write(reqBody);
+      }
       req.end();
     });
   } catch (err) {
