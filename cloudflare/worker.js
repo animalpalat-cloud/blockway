@@ -7,14 +7,13 @@ export default {
       return new Response("Missing ?url=", { status: 400 });
     }
 
-    const normalizedTarget = normalizeTargetParam(targetParam);
+    const normalizedTarget = normalizeTargetParam(targetParam, refParam);
     if (!normalizedTarget) {
       return new Response("Invalid target URL", { status: 400 });
     }
     const targetUrl = normalizedTarget;
 
-    const normalizedReferer = safeHttpUrl(refParam) || `${targetUrl.origin}/`;
-    const refererUrl = new URL(normalizedReferer);
+    const masked = buildMaskedNavigationContext(targetUrl, refParam);
 
     const upstreamHeaders = new Headers(request.headers);
     stripProxyIdentityHeaders(upstreamHeaders);
@@ -24,8 +23,8 @@ export default {
       "user-agent",
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
     );
-    upstreamHeaders.set("referer", normalizedReferer);
-    upstreamHeaders.set("origin", refererUrl.origin);
+    upstreamHeaders.set("referer", masked.referer);
+    upstreamHeaders.set("origin", masked.origin);
     if (!upstreamHeaders.has("accept")) {
       upstreamHeaders.set(
         "accept",
@@ -54,6 +53,8 @@ export default {
     responseHeaders.delete("cross-origin-opener-policy");
     responseHeaders.delete("cross-origin-embedder-policy");
     responseHeaders.delete("cross-origin-resource-policy");
+    responseHeaders.delete("set-cookie");
+    rewriteSetCookieHeaders(upstream.headers, responseHeaders, incomingUrl.hostname);
     responseHeaders.set("x-proxy-upstream", targetUrl.origin);
 
     // Stream body directly to client to support large MP4/HLS segment traffic.
@@ -65,11 +66,12 @@ export default {
   },
 };
 
-function normalizeTargetParam(raw) {
+function normalizeTargetParam(raw, refParam) {
   if (!raw) return null;
   const seen = new Set();
   let cur = String(raw).trim();
   if (!cur) return null;
+  const safeRef = safeHttpUrl(refParam);
 
   // Handle double-encoded query values from nested proxy hops.
   for (let i = 0; i < 4; i += 1) {
@@ -77,6 +79,14 @@ function normalizeTargetParam(raw) {
     seen.add(cur);
     const candidate = safeHttpUrl(cur);
     if (candidate) return new URL(candidate);
+    if (safeRef) {
+      try {
+        const maybeRelative = new URL(cur, safeRef);
+        if (maybeRelative.protocol === "http:" || maybeRelative.protocol === "https:") {
+          return maybeRelative;
+        }
+      } catch {}
+    }
     try {
       const decoded = decodeURIComponent(cur);
       if (decoded === cur) break;
@@ -127,4 +137,43 @@ function stripProxyIdentityHeaders(headers) {
     "sec-fetch-user",
   ];
   for (const name of strip) headers.delete(name);
+}
+
+function buildMaskedNavigationContext(targetUrl, refParam) {
+  const safeRef = safeHttpUrl(refParam);
+  if (safeRef) {
+    try {
+      const ref = new URL(safeRef);
+      // Keep same-site referers; otherwise mask to target origin to avoid 403 anti-hotlinking.
+      if (ref.hostname === targetUrl.hostname) {
+        return { referer: ref.toString(), origin: ref.origin };
+      }
+    } catch {}
+  }
+  return { referer: `${targetUrl.origin}/`, origin: targetUrl.origin };
+}
+
+function getSetCookies(headers) {
+  if (typeof headers.getSetCookie === "function") {
+    return headers.getSetCookie();
+  }
+  const one = headers.get("set-cookie");
+  return one ? [one] : [];
+}
+
+function rewriteCookieForProxyHost(cookie, proxyHost) {
+  let out = String(cookie);
+  out = out.replace(/;\s*domain=[^;]*/gi, "");
+  out = out.replace(/;\s*samesite=none/gi, "; SameSite=Lax");
+  if (!/;\s*path=/i.test(out)) out += "; Path=/";
+  if (!/;\s*domain=/i.test(out)) out += `; Domain=${proxyHost}`;
+  return out;
+}
+
+function rewriteSetCookieHeaders(upstreamHeaders, responseHeaders, proxyHost) {
+  const values = getSetCookies(upstreamHeaders);
+  for (const cookie of values) {
+    if (!cookie) continue;
+    responseHeaders.append("set-cookie", rewriteCookieForProxyHost(cookie, proxyHost));
+  }
 }
