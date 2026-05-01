@@ -337,10 +337,13 @@ export async function doProxy(
     if (!resHeaders.get("x-proxy-render")) resHeaders.set("x-proxy-render", "fetch");
 
     clearTimeout(timer);
-    const finalRes = new NextResponse(body, {
-      status: upstreamRes.status,
-      headers: resHeaders,
-    });
+    const finalRes = new NextResponse(
+      (body instanceof Buffer ? new Uint8Array(body) : body) as BodyInit,
+      {
+        status: upstreamRes.status,
+        headers: resHeaders,
+      }
+    );
     attachSessionCookie(finalRes, sessionId);
     return finalRes;
   } catch (err) {
