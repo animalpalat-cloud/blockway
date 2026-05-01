@@ -147,7 +147,7 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
       // Stop proxying internal/private IP addresses (SSRF protection)
       var hst = (x.hostname || "").toLowerCase();
       if (
-        /^(localhost|127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.)/.test(hst) ||
+        /^(localhost|127[.]|192[.]168[.]|10[.]|172[.](1[6-9]|2[0-9]|3[01])[.]|169[.]254[.]|0[.])/.test(hst) ||
         hst.indexOf(".local") !== -1 || hst.indexOf(".internal") !== -1
       ) {
         return u;
@@ -551,8 +551,10 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
       var l = n.toLowerCase();
       if (ATTRS[l] || (l.indexOf("data-") === 0 && /src|href|url|set|original|bg/i.test(l)) || l === "xlink:href") {
         if (l === "style") {
-            var sv = v.replace(/url\(\s*(['"]?)([^'"\)\s]+)\1\s*\)/gi, function(m, q, inn) {
-                if (inn.indexOf("data:") === 0) return m;
+            var sv = v.replace(/url\([ \t\r\n\f]*(?:'([^']*)'|"([^"]*)"|([^'"\)[ \t\r\n\f]]+))[ \t\r\n\f]*\)/gi, function(m, q1, q2, unq) {
+                var inn = q1 || q2 || unq;
+                if (!inn || inn.indexOf("data:") === 0) return m;
+                var q = q1 ? "'" : (q2 ? "\"" : "");
                 return "url(" + q + p(inn) + q + ")";
             });
             if (sv !== v) {
@@ -595,11 +597,14 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         if (root.tagName === "STYLE" && root.innerHTML) {
             var inner = root.innerHTML;
             if (inner.indexOf("url(") !== -1) {
-                var rewritten = inner.replace(/url\(\s*(['"]?)([^'"\)\s]+)\1\s*\)/gi, function(m, q, inn) {
-                    if (inn.indexOf("data:") === 0) return m;
+                var rewritten = inner.replace(/url\([ \t\r\n\f]*(?:'([^']*)'|"([^"]*)"|([^'"\)[ \t\r\n\f]]+))[ \t\r\n\f]*\)/gi, function(m, q1, q2, unq) {
+                    var inn = q1 || q2 || unq;
+                    if (!inn || inn.indexOf("data:") === 0) return m;
+                    var q = q1 ? "'" : (q2 ? "\"" : "");
                     return "url(" + q + p(inn) + q + ")";
                 });
-                rewritten = rewritten.replace(/@import\s+(?:url\()?['"]?([^'"\)\s]+)['"]?\)?/gi, function(m, inn) {
+                rewritten = rewritten.replace(/@import[ \t\r\n\f]+(?:url\()?(?:'([^']*)'|"([^"]*)"|([^'"\)[ \t\r\n\f]]+))\)?/gi, function(m, q1, q2, unq) {
+                    var inn = q1 || q2 || unq;
                     return "@import url(\"" + p(inn) + "\")";
                 });
                 if (rewritten !== inner) {
