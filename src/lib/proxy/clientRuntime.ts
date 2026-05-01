@@ -143,6 +143,16 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
       var okP =
         x.protocol === "http:" || x.protocol === "https:" || x.protocol === "ws:" || x.protocol === "wss:";
       if (!okP) return u;
+
+      // Stop proxying internal/private IP addresses (SSRF protection)
+      var hst = (x.hostname || "").toLowerCase();
+      if (
+        /^(localhost|127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.)/.test(hst) ||
+        hst.indexOf(".local") !== -1 || hst.indexOf(".internal") !== -1
+      ) {
+        return u;
+      }
+
       if (isAlreadyProxied(x.href)) return x.href;
       // Keep only internal proxy/runtime endpoints direct on proxy host.
       try {
@@ -222,7 +232,18 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   if (typeof window !== "undefined" && typeof window.fetch === "function") {
     var f0 = window.fetch;
     window.fetch = function (i, init) {
-      if (typeof i === "string") return f0.call(this, p(i), init);
+      if (typeof i === "string") {
+        var u1 = p(i);
+        return f0.call(this, u1, init).then(function (res) {
+          if (res && u1.indexOf("/api/front/batch/") !== -1) {
+            try {
+              var c = res.clone();
+              c.json().catch(function () {});
+            } catch (e) {}
+          }
+          return res;
+        });
+      }
       if (typeof Request !== "undefined" && i instanceof Request) {
         var u2 = p(i.url);
         if (u2 === i.url) return f0.call(this, i, init);
@@ -237,7 +258,15 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
             // Fallback for tricky bodies
             return f0.call(this, u2, init);
         }
-        return f0.call(this, newReq, init);
+        return f0.call(this, newReq, init).then(function (res) {
+          if (res && u2.indexOf("/api/front/batch/") !== -1) {
+            try {
+              var c = res.clone();
+              c.json().catch(function () {});
+            } catch (e) {}
+          }
+          return res;
+        });
       }
       return f0.call(this, i, init);
     };
@@ -362,9 +391,9 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
       if (v != null) {
         if (
           /^(src|href|action|formaction|srcset|imagesrcset|poster|data)$/i.test(n) ||
-          (n.indexOf("data-") === 0 && /src|href|url|set/i.test(n))
+          (n.indexOf("data-") === 0 && /src|href|url|set|original|bg/i.test(n))
         ) {
-          v = /^srcset$/i.test(n) || /imagesrcset/i.test(n) ? srcsetP(String(v)) : p(String(v));
+          v = /srcset/i.test(n) ? srcsetP(String(v)) : p(String(v));
         }
       }
       return sa.call(this, n, v);
@@ -510,7 +539,7 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   } catch (eBase) {}
 
   var moR = 0;
-  var ATTRS = { src: 1, href: 1, action: 1, formaction: 1, poster: 1, data: 1, srcset: 1, imagesrcset: 1, cite: 1, background: 1, form: 1 };
+  var ATTRS = { src: 1, href: 1, action: 1, formaction: 1, poster: 1, data: 1, srcset: 1, imagesrcset: 1, cite: 1, background: 1, form: 1, style: 1 };
   function runMoAttr(el) {
     if (moR > 0) return;
     if (!el || el.nodeType !== 1) return;
@@ -520,7 +549,17 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
       var n = a.name, v = a.value;
       if (!v) continue;
       var l = n.toLowerCase();
-      if (ATTRS[l] || (l.indexOf("data-") === 0 && /src|href|url|set/i.test(l)) || l === "xlink:href") {
+      if (ATTRS[l] || (l.indexOf("data-") === 0 && /src|href|url|set|original|bg/i.test(l)) || l === "xlink:href") {
+        if (l === "style") {
+            var sv = v.replace(/url\(\s*(['"]?)([^'"\)\s]+)\1\s*\)/gi, function(m, q, inn) {
+                if (inn.indexOf("data:") === 0) return m;
+                return "url(" + q + p(inn) + q + ")";
+            });
+            if (sv !== v) {
+              try { ++moR; el.setAttribute(n, sv); --moR; return; } catch(e) {}
+            }
+            continue;
+        }
         var nv = /srcset$|imagesrcset$/.test(l) ? srcsetP(v) : p(v);
         if (nv !== v) {
           try {
@@ -549,8 +588,25 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         (root.tagName === "TRACK" && root.hasAttribute("src")) ||
         (root.tagName === "INPUT" && root.hasAttribute("src")) ||
         (root.tagName === "USE" && (root.hasAttribute("href") || root.hasAttribute("xlink:href"))) ||
-        (root.tagName === "IMAGE" && (root.hasAttribute("href") || root.hasAttribute("xlink:href")))
+        (root.tagName === "IMAGE" && (root.hasAttribute("href") || root.hasAttribute("xlink:href"))) ||
+        root.hasAttribute("style") ||
+        (root.tagName === "STYLE")
       ) {
+        if (root.tagName === "STYLE" && root.innerHTML) {
+            var inner = root.innerHTML;
+            if (inner.indexOf("url(") !== -1) {
+                var rewritten = inner.replace(/url\(\s*(['"]?)([^'"\)\s]+)\1\s*\)/gi, function(m, q, inn) {
+                    if (inn.indexOf("data:") === 0) return m;
+                    return "url(" + q + p(inn) + q + ")";
+                });
+                rewritten = rewritten.replace(/@import\s+(?:url\()?['"]?([^'"\)\s]+)['"]?\)?/gi, function(m, inn) {
+                    return "@import url(\"" + p(inn) + "\")";
+                });
+                if (rewritten !== inner) {
+                    try { ++moR; root.innerHTML = rewritten; --moR; } catch(e) {}
+                }
+            }
+        }
         runMoAttr(root);
       }
     }

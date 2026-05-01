@@ -2,6 +2,7 @@ import * as cheerio from "cheerio";
 import type { CheerioAPI } from "cheerio";
 import { buildClientRuntimePatch } from "./clientRuntime";
 import { absUrl, isLikelyUrl, proxyParamUrl, skipRewrite } from "./urls";
+import { rewriteCss, rewriteUrlCallsInString } from "./rewriteCss";
 
 const URL_ATTRS: { sel: string; attr: string }[] = [
   { sel: "a[href]", attr: "href" },
@@ -28,6 +29,11 @@ const URL_ATTRS: { sel: string; attr: string }[] = [
   { sel: "button[formaction]", attr: "formaction" },
   { sel: "use[href]", attr: "href" },
   { sel: "use[xlink\\:href]", attr: "xlink:href" },
+  { sel: "[data-src]", attr: "data-src" },
+  { sel: "[data-srcset]", attr: "data-srcset" },
+  { sel: "[data-original]", attr: "data-original" },
+  { sel: "[data-bg]", attr: "data-bg" },
+  { sel: "[data-href]", attr: "data-href" },
 ];
 
 const TRACKING_PATTERNS = [
@@ -133,15 +139,14 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
       if (!v) return;
-      if (attr === "srcset") {
+      if (attr === "srcset" || attr === "data-srcset") {
         const next = rewriteSrcsetValue(v, base);
         if (next && next !== v) $(el).attr(attr, next);
         return;
       }
       if (sel === "link[href]") {
         const rel = String($(el).attr("rel") || "").toLowerCase();
-        const isCss = rel.includes("stylesheet") || /\.css(?:$|\?)/i.test(v);
-        if (!isCss) return;
+        // Remove the skip condition: we want to proxy icons, preloads, etc. as well.
       }
       if (sel === "a[href]") {
         const aAbs = absUrl(v, base) || v;
@@ -154,6 +159,25 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
       if (next && next !== v) $(el).attr(attr, next);
     });
   }
+
+  // Rewrite style attributes (inline CSS)
+  $("[style]").each((_, el) => {
+    const styleVal = $(el).attr("style");
+    if (styleVal && styleVal.includes("url(")) {
+      const rewritten = rewriteUrlCallsInString(styleVal, base);
+      if (rewritten !== styleVal) {
+        $(el).attr("style", rewritten);
+      }
+    }
+  });
+
+  // Rewrite <style> blocks
+  $("style").each((_, el) => {
+    const inner = $(el).html();
+    if (inner && inner.includes("url(")) {
+      $(el).html(rewriteCss(inner, base));
+    }
+  });
 }
 
 /** Inert <template> / <noscript> content: rewrites only, no <base> / runtime. */

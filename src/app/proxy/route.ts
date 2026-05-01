@@ -32,13 +32,17 @@ export async function POST(request: NextRequest) {
   if (qpUrl) {
     return doProxy(request, qpUrl, "POST");
   }
+  let rawBody: Buffer | undefined;
   try {
-    const body = (await request.json()) as { url?: string };
+    const arrayBuffer = await request.arrayBuffer();
+    rawBody = Buffer.from(arrayBuffer);
+    const bodyText = rawBody.toString("utf-8");
+    const body = JSON.parse(bodyText) as { url?: string };
     const target = body?.url?.trim() ?? "";
     if (!target) {
       return jsonError("Missing url in JSON body.", 400);
     }
-    return doProxy(request, target, "POST");
+    return doProxy(request, target, "POST", rawBody);
   } catch {
     return jsonError("Missing url query parameter or valid JSON body.", 400);
   }

@@ -25,15 +25,10 @@ const HOP_BY_HOP = new Set([
   "expect",
   "max-forwards",
   "cookie",
-  "authorization",
 ]);
 
 /** Replaced with browser-like values so the upstream sees a real client, not a generic bot. */
 const INCOMING_STRIP = new Set([
-  "user-agent",
-  "accept",
-  "accept-language",
-  "accept-encoding",
   "referer",
   "origin",
   "sec-fetch-dest",
@@ -41,9 +36,6 @@ const INCOMING_STRIP = new Set([
   "sec-fetch-site",
   "sec-fetch-user",
   "sec-fetch-dest-fragment",
-  "sec-ch-ua",
-  "sec-ch-ua-mobile",
-  "sec-ch-ua-platform",
   "downlink",
   "dpr",
   "save-data",
@@ -80,18 +72,20 @@ export function buildUpstreamRequestHeaders(
   incoming.forEach((value, key) => {
     const l = key.toLowerCase();
     if (INCOMING_STRIP.has(l)) return;
-    if (l === "cookie" || l === "authorization") return;
+    if (l === "cookie") return; // Handled below
     out.set(key, value);
   });
 
-  out.set("user-agent", pickUserAgentForUpstream());
-  out.set("accept", buildAcceptForKind(kind));
-  out.set("accept-language", pickAcceptLanguage());
-  out.set("accept-encoding", DEFAULT_ACCEPT_ENCODING);
+  if (!out.has("user-agent")) out.set("user-agent", pickUserAgentForUpstream());
+  if (!out.has("accept")) out.set("accept", buildAcceptForKind(kind));
+  if (!out.has("accept-language")) out.set("accept-language", pickAcceptLanguage());
+  if (!out.has("accept-encoding")) out.set("accept-encoding", DEFAULT_ACCEPT_ENCODING);
 
   const ua = out.get("user-agent") || "";
-  const ch = pickSecChUa(ua);
-  Object.entries(ch).forEach(([k, v]) => out.set(k, v));
+  if (!out.has("sec-ch-ua")) {
+      const ch = pickSecChUa(ua);
+      Object.entries(ch).forEach(([k, v]) => out.set(k, v));
+  }
 
   const { referer, origin } = buildRefererAndOrigin(target, ref);
   out.set("referer", referer);
@@ -110,9 +104,11 @@ export function buildUpstreamRequestHeaders(
     out.set("upgrade-insecure-requests", "1");
   }
 
+  const clientCookie = incoming.get("cookie");
   const jar = cookieHeaderForHost(options.sessionId, options.jarHost);
-  if (jar) {
-    out.set("cookie", jar);
+  const combinedCookies = [clientCookie, jar].filter(Boolean).join("; ");
+  if (combinedCookies) {
+    out.set("cookie", combinedCookies);
   }
 
   out.set("cache-control", "no-cache");

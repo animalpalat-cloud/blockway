@@ -86,10 +86,8 @@ const CHROME_LIKE_UAS = [
 
 // These incoming headers are replaced with spoofed browser-like equivalents
 const INCOMING_STRIP = new Set([
-    'user-agent', 'accept', 'accept-language', 'accept-encoding',
     'referer', 'origin',
     'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user',
-    'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
     'host', 'connection', 'content-length',
     // Strip proxy-reveal headers
     'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
@@ -115,44 +113,51 @@ function buildSpoofedHeaders(incoming, targetParsed, ref) {
     // 1. Pass through safe, non-revealing client headers
     Object.entries(incoming).forEach(([k, v]) => {
         const l = k.toLowerCase();
-        if (!INCOMING_STRIP.has(l) && !l.startsWith('x-')) out[l] = v;
+        if (!INCOMING_STRIP.has(l)) out[l] = v;
     });
 
-    // 2. Rotate User-Agent
-    const ua = CHROME_LIKE_UAS[Math.floor(Math.random() * CHROME_LIKE_UAS.length)];
-    out['user-agent'] = ua;
-
-    // 3. Context-appropriate Accept header
-    const kind = inferKind(targetParsed);
-    if (kind === 'script') {
-        out['accept'] = '*/*';
-    } else if (kind === 'style') {
-        out['accept'] = 'text/css,*/*;q=0.1';
-    } else if (kind === 'image') {
-        out['accept'] = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
-    } else if (kind === 'font') {
-        out['accept'] = 'application/font-woff2;q=1.0,font/woff2;q=1.0,*/*;q=0.8';
-    } else {
-        out['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
+    // 2. Rotate User-Agent (Fallback only)
+    if (!out['user-agent']) {
+        const ua = CHROME_LIKE_UAS[Math.floor(Math.random() * CHROME_LIKE_UAS.length)];
+        out['user-agent'] = ua;
     }
 
-    out['accept-language'] = 'en-US,en;q=0.9';
-    out['accept-encoding'] = 'identity';
+    // 3. Context-appropriate Accept header (Fallback only)
+    const kind = inferKind(targetParsed);
+    if (!out['accept']) {
+        if (kind === 'script') {
+            out['accept'] = '*/*';
+        } else if (kind === 'style') {
+            out['accept'] = 'text/css,*/*;q=0.1';
+        } else if (kind === 'image') {
+            out['accept'] = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
+        } else if (kind === 'font') {
+            out['accept'] = 'application/font-woff2;q=1.0,font/woff2;q=1.0,*/*;q=0.8';
+        } else {
+            out['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
+        }
+    }
+
+    if (!out['accept-language']) out['accept-language'] = 'en-US,en;q=0.9';
+    if (!out['accept-encoding']) out['accept-encoding'] = 'identity';
 
     // 4. Matching Sec-Ch-Ua client hints
-    const m = ua.match(/Chrome\/(\d+)\.(\d+)\.(\d+)\.(\d+)/) || ua.match(/Chrome\/(\d+)/);
-    const version = m ? m[1] : '131';
-    const fullVersion = m && m[0] ? m[0].split('/')[1] : `${version}.0.0.0`;
-    const isEdge = ua.includes('Edg/');
+    if (!out['sec-ch-ua']) {
+        const uaStr = out['user-agent'] || "";
+        const m = uaStr.match(/Chrome\/(\d+)\.(\d+)\.(\d+)\.(\d+)/) || uaStr.match(/Chrome\/(\d+)/);
+        const version = m ? m[1] : '131';
+        const fullVersion = m && m[0] ? m[0].split('/')[1] : `${version}.0.0.0`;
+        const isEdge = uaStr.includes('Edg/');
 
-    out['sec-ch-ua'] = isEdge
-        ? `"Not A(Brand";v="99", "Microsoft Edge";v="${version}", "Chromium";v="${version}"`
-        : `"Not A(Brand";v="99", "Google Chrome";v="${version}", "Chromium";v="${version}"`;
-    out['sec-ch-ua-mobile'] = '?0';
-    out['sec-ch-ua-platform'] = ua.includes('Windows') ? '"Windows"' : ua.includes('Mac') ? '"macOS"' : '"Linux"';
-    out['sec-ch-ua-full-version-list'] = isEdge
-        ? `"Not A(Brand";v="99.0.0.0", "Microsoft Edge";v="${fullVersion}", "Chromium";v="${fullVersion}"`
-        : `"Not A(Brand";v="99.0.0.0", "Google Chrome";v="${fullVersion}", "Chromium";v="${fullVersion}"`;
+        out['sec-ch-ua'] = isEdge
+            ? `"Not A(Brand";v="99", "Microsoft Edge";v="${version}", "Chromium";v="${version}"`
+            : `"Not A(Brand";v="99", "Google Chrome";v="${version}", "Chromium";v="${version}"`;
+        out['sec-ch-ua-mobile'] = '?0';
+        out['sec-ch-ua-platform'] = uaStr.includes('Windows') ? '"Windows"' : uaStr.includes('Mac') ? '"macOS"' : '"Linux"';
+        out['sec-ch-ua-full-version-list'] = isEdge
+            ? `"Not A(Brand";v="99.0.0.0", "Microsoft Edge";v="${fullVersion}", "Chromium";v="${fullVersion}"`
+            : `"Not A(Brand";v="99.0.0.0", "Google Chrome";v="${fullVersion}", "Chromium";v="${fullVersion}"`;
+    }
 
     // 5. Referer & Origin
     let referer = `${targetParsed.origin}/`;
@@ -229,10 +234,15 @@ function proxyUrl(target, base, reqHost) {
 }
 
 function rewriteCss(css, base, reqHost) {
-    return css.replace(/url\s*\(\s*(['"]?)([^'")\s]+)\1\s*\)/gi, (match, quote, inner) => {
+    let out = css.replace(/url\s*\(\s*(['"]?)([^'")\s]+)\1\s*\)/gi, (match, quote, inner) => {
         const rewritten = proxyUrl(inner, base, reqHost);
         return `url("${rewritten}")`;
     });
+    out = out.replace(/@import\s+(?:url\()?['"]?([^'"\)\s]+)['"]?\)?/gi, (match, inner) => {
+        const rewritten = proxyUrl(inner, base, reqHost);
+        return `@import url("${rewritten}")`;
+    });
+    return out;
 }
 
 function rewriteSrcset(srcset, base, reqHost) {
@@ -309,6 +319,11 @@ function rewriteHtml(html, base, reqHost) {
         { sel: 'image',                attr: 'xlink:href' },
         { sel: 'input[type=image]',    attr: 'src' },
         { sel: 'button[formaction]',   attr: 'formaction' },
+        { sel: '[data-src]',           attr: 'data-src' },
+        { sel: '[data-srcset]',        attr: 'data-srcset', isSrcset: true },
+        { sel: '[data-original]',      attr: 'data-original' },
+        { sel: '[data-bg]',            attr: 'data-bg' },
+        { sel: '[data-href]',          attr: 'data-href' },
     ];
 
     URL_ATTRS.forEach(({ sel, attr, isSrcset }) => {
@@ -421,9 +436,9 @@ app.all(PROXY_PATH, (req, res) => {
     }
 
     // Fix 1 (cont): Build upstream path preserving the exact path + query from
-    // the parsed URL object so special chars are properly percent-encoded.
+    // the parsed URL object so special chars are properly percent-encoded,
+    // but DO NOT force-encode parentheses, as CDNs require them literally.
     let upstreamPath = targetParsed.pathname + targetParsed.search;
-    upstreamPath = upstreamPath.replace(/[()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
     const options = {
         agent:   socksAgent,

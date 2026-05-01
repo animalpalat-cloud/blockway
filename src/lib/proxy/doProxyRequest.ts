@@ -107,7 +107,8 @@ function buildPuppeteerProxyResponse(
 export async function doProxy(
   request: NextRequest,
   targetUrlStr: string,
-  method: "GET" | "POST" | "HEAD" = "GET",
+  method: string = "GET",
+  overrideBody?: Buffer,
 ): Promise<NextResponse> {
   const sessionId = getSessionId(request);
 
@@ -180,11 +181,16 @@ export async function doProxy(
     { sessionId, jarHost, documentReferer },
   );
 
-  try {
-    const reqBody =
-      method === "POST"
-        ? Buffer.from(await request.arrayBuffer())
-        : undefined;
+    const methodsWithBody = ["POST", "PUT", "PATCH", "DELETE"];
+    let reqBody: Buffer | undefined = overrideBody;
+    
+    if (!reqBody && methodsWithBody.includes(method)) {
+        try {
+            reqBody = Buffer.from(await request.arrayBuffer());
+        } catch (e) {
+            // Body might be already consumed or empty
+        }
+    }
 
     if (apiLike || method === "POST") {
 
@@ -194,16 +200,24 @@ export async function doProxy(
     upstream = await new Promise((resolve, reject) => {
       const isTargetHttps = parsed.protocol === 'https:';
       const requestModule = isTargetHttps ? https : http;
-      
-      // Ensure outgoing path is safely encoded for strict CDNs
-      let safePath = parsed.pathname + parsed.search;
-      safePath = safePath.replace(/[()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+
+      // Ensure outgoing path is exactly what the parsed URL provides.
+      // Do NOT force-encode parentheses; CDNs like xhpingcdn require literal `s(w:526,h:298)`
+      // and will return 400 Bad Request if they receive `s%28w:526,h:298%29`.
+      if (reqBody !== undefined) {
+        headers.set("content-length", String(reqBody.length));
+        // Ensure content-type is preserved if it was in the incoming request
+        const incomingContentType = request.headers.get("content-type");
+        if (incomingContentType && !headers.has("content-type")) {
+            headers.set("content-type", incomingContentType);
+        }
+      }
 
       const proxyOptions = {
         method: method,
         hostname: parsed.hostname,
         port: parsed.port || (isTargetHttps ? 443 : 80),
-        path: safePath,
+        path: parsed.pathname + parsed.search,
         headers: Object.fromEntries(headers.entries()),
         agent: socksAgent,
         signal: controller.signal
