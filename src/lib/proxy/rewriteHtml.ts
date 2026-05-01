@@ -203,8 +203,22 @@ export function rewriteHtml(
   injectClientRuntime: boolean,
 ): string {
   const $ = cheerio.load(html, { xml: false });
-  applyCoreRewrites($, base);
-  rewriteInertSubfragments($, base);
+
+  // 1. Detect and handle <base href>
+  let effectiveBase = base;
+  const baseEl = $("base[href]");
+  if (baseEl.length) {
+    const baseHref = baseEl.attr("href");
+    if (baseHref) {
+      try {
+        effectiveBase = new URL(baseHref, base).toString();
+      } catch (e) {}
+    }
+  }
+
+  // 2. Perform rewrites using the effective base
+  applyCoreRewrites($, effectiveBase);
+  rewriteInertSubfragments($, effectiveBase);
 
   const headInject: string[] = [];
   if (injectClientRuntime) {

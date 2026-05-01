@@ -174,7 +174,7 @@ export async function doProxy(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
 
-  let upstream: { status: number, headers: Headers, body: Buffer, url: string };
+
   const headers = buildUpstreamRequestHeaders(
     request.headers,
     parsed,
@@ -194,16 +194,12 @@ export async function doProxy(
     }
 
     // Call target directly via SOCKS5 proxy
-    upstream = await new Promise((resolve, reject) => {
+    const upstreamRes: { status: number, headers: Headers, body: ReadableStream | Buffer, url: string, isStream: boolean } = await new Promise((resolve, reject) => {
       const isTargetHttps = parsed.protocol === 'https:';
       const requestModule = isTargetHttps ? https : http;
 
-      // Ensure outgoing path is exactly what the parsed URL provides.
-      // Do NOT force-encode parentheses; CDNs like xhpingcdn require literal `s(w:526,h:298)`
-      // and will return 400 Bad Request if they receive `s%28w:526,h:298%29`.
       if (reqBody !== undefined) {
         headers.set("content-length", String(reqBody.length));
-        // Ensure content-type is preserved if it was in the incoming request
         const incomingContentType = request.headers.get("content-type");
         if (incomingContentType && !headers.has("content-type")) {
             headers.set("content-type", incomingContentType);
@@ -221,37 +217,57 @@ export async function doProxy(
       };
 
       const req = requestModule.request(proxyOptions, (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const resBody = Buffer.concat(chunks);
-          
-          // Relay the response headers
-          const resHeaders = new Headers();
-          for (const [key, value] of Object.entries(res.headers)) {
-            if (value) {
-              if (Array.isArray(value)) {
-                value.forEach(v => resHeaders.append(key, v));
-              } else {
-                resHeaders.set(key, value);
-              }
+        const resHeaders = new Headers();
+        for (const [key, value] of Object.entries(res.headers)) {
+          if (value) {
+            if (Array.isArray(value)) {
+              value.forEach(v => resHeaders.append(key, v));
+            } else {
+              resHeaders.set(key, value);
             }
           }
+        }
 
+        const contentType = resHeaders.get("content-type") || "";
+        const isStreamingType = /video|audio|image|zip|pdf|octet-stream/i.test(contentType) || 
+                               res.statusCode === 206 || 
+                               (method === "GET" && !/html|css|javascript|json/i.test(contentType));
+
+        if (isStreamingType) {
+          const stream = new ReadableStream({
+            start(controller) {
+              res.on("data", (chunk) => controller.enqueue(new Uint8Array(chunk)));
+              res.on("end", () => controller.close());
+              res.on("error", (err) => controller.error(err));
+            },
+            cancel() {
+              res.destroy();
+            }
+          });
           resolve({
             status: res.statusCode || 200,
             headers: resHeaders,
-            body: resBody,
-            url: parsed.toString()
+            body: stream,
+            url: parsed.toString(),
+            isStream: true
           });
-        });
+        } else {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          res.on('end', () => {
+            resolve({
+              status: res.statusCode || 200,
+              headers: resHeaders,
+              body: Buffer.concat(chunks),
+              url: parsed.toString(),
+              isStream: false
+            });
+          });
+        }
       });
 
       req.on('error', (err) => reject(err));
-
-      if (reqBody) {
-        req.write(reqBody);
-      }
+      if (reqBody) req.write(reqBody);
       req.end();
     });
   } catch (err) {
@@ -262,104 +278,85 @@ export async function doProxy(
     const msg = err instanceof Error ? err.message : "Could not reach target URL.";
     return json(msg, 502, sessionId);
   }
-  clearTimeout(timer);
+    absorbSetCookieHeaders(sessionId, jarHost, upstreamRes.headers);
 
-  absorbSetCookieHeaders(sessionId, jarHost, upstream.headers);
+    const resHeaders = new Headers();
+    upstreamRes.headers.forEach((value, key) => {
+      if (!STRIP_FROM_RESPONSE.has(key.toLowerCase())) {
+        resHeaders.set(key, value);
+      }
+    });
 
-  const cl = Number(upstream.headers.get("content-length") ?? 0);
-  if (cl && cl > maxBytes) {
-    return json("Response too large.", 413, sessionId);
-  }
-
-  const contentType = upstream.headers.get("content-type") ?? "application/octet-stream";
-  const finalUrl = upstream.url || parsed.toString();
-  const encoding = upstream.headers.get("content-encoding");
-  const hasBody = method !== "HEAD";
-  const rawBuf = hasBody ? upstream.body : Buffer.alloc(0);
-
-  // Decompress before processing strings
-  const buf = decompress(rawBuf, encoding);
-
-  if (buf.length > maxBytes) {
-    return json("Response too large.", 413, sessionId);
-  }
-
-  const ct = contentType.toLowerCase();
-  const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
-  const isCss = ct.includes("text/css");
-  const isJs = ct.includes("javascript") || ct.includes("application/x-javascript");
-
-  // Only attempt to process as string if it's a known text type
-  const sniffHtml =
-    (!apiLike && isHtml) ||
-    (!apiLike && ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
-
-  let body: Buffer = buf;
-  if (hasBody && sniffHtml) {
-    try {
-      body = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true), "utf-8");
-    } catch (err) {
-      console.error("[proxy] HTML rewrite failed:", err);
-    }
-  } else if (hasBody && isCss) {
-    try {
-      body = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
-    } catch (err) {
-      console.error("[proxy] CSS rewrite failed:", err);
-    }
-  }
-  if (apiLike && upstream.status >= 400) {
-
-  }
-
-  const resHeaders = new Headers();
-  upstream.headers.forEach((value, key) => {
-    if (!STRIP_FROM_RESPONSE.has(key.toLowerCase())) {
-      resHeaders.set(key, value);
-    }
-  });
-
-  // Rewrite Location header for redirects so they stay within the proxy
-  const locationHeader = resHeaders.get("location");
-  if (locationHeader && !locationHeader.startsWith("/")) {
-    try {
-      // Handle both relative and absolute location headers
-      const absLocation = new URL(locationHeader, finalUrl).toString();
-      resHeaders.set("location", `/proxy?url=${encodeURIComponent(absLocation)}`);
-    } catch (e) {
-      // fallback
-    }
-  } else if (locationHeader && locationHeader.startsWith("/")) {
+    resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
+    resHeaders.set("pragma", "no-cache");
+    applyCorsHeaders(resHeaders);
+    resHeaders.set("x-proxy-final-url", upstreamRes.url);
+    resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
+    
+    const locationHeader = resHeaders.get("location");
+    if (locationHeader) {
       try {
-          const absLocation = new URL(locationHeader, finalUrl).toString();
-          resHeaders.set("location", `/proxy?url=${encodeURIComponent(absLocation)}`);
+        const absLocation = new URL(locationHeader, upstreamRes.url).toString();
+        resHeaders.set("location", `/proxy?url=${encodeURIComponent(absLocation)}`);
       } catch (e) {}
-  }
+    }
 
-  if (!apiLike && sniffHtml) {
-    resHeaders.set("content-type", "text/html; charset=utf-8");
-  } else if (!apiLike && isCss) {
-    resHeaders.set("content-type", "text/css; charset=utf-8");
-  }
-  if (!resHeaders.get("x-proxy-render")) {
-    resHeaders.set("x-proxy-render", "fetch");
-  }
-  // Never forward CSP: proxied + injected assets must be allowed
-  resHeaders.delete("content-security-policy");
-  resHeaders.delete("content-security-policy-report-only");
+    if (upstreamRes.isStream) {
+      clearTimeout(timer);
+      const streamRes = new NextResponse(upstreamRes.body as ReadableStream, {
+        status: upstreamRes.status,
+        headers: resHeaders
+      });
+      attachSessionCookie(streamRes, sessionId);
+      return streamRes;
+    }
 
-  resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
-  resHeaders.set("pragma", "no-cache");
-  applyCorsHeaders(resHeaders);
-  resHeaders.set("x-proxy-final-url", finalUrl);
-  resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
-  resHeaders.delete("content-length");
-  resHeaders.delete("content-encoding");
+    const buf = upstreamRes.body as Buffer;
+    const encoding = upstreamRes.headers.get("content-encoding");
+    const decompressed = decompress(buf, encoding);
+    
+    if (decompressed.length > maxBytes) {
+      clearTimeout(timer);
+      return json("Response too large.", 413, sessionId);
+    }
 
-  const res = new NextResponse(
-    new Uint8Array(body),
-    { status: upstream.status, headers: resHeaders },
-  );
-  attachSessionCookie(res, sessionId);
-  return res;
+    const contentType = upstreamRes.headers.get("content-type") ?? "application/octet-stream";
+    const ct = contentType.toLowerCase();
+    const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
+    const isCss = ct.includes("text/css");
+
+    const sniffHtml = (!apiLike && isHtml) ||
+      (!apiLike && ct.includes("text/plain") && /^\s*</.test(decompressed.toString("utf-8", 0, 512)));
+
+    let body: Buffer | string = decompressed;
+    if (method !== "HEAD") {
+      if (sniffHtml) {
+        body = rewriteHtml(decompressed.toString("utf-8"), upstreamRes.url, true);
+        resHeaders.set("content-type", "text/html; charset=utf-8");
+      } else if (isCss) {
+        body = rewriteCss(decompressed.toString("utf-8"), upstreamRes.url);
+        resHeaders.set("content-type", "text/css; charset=utf-8");
+      }
+    }
+
+    resHeaders.delete("content-length");
+    resHeaders.delete("content-encoding");
+    if (!resHeaders.get("x-proxy-render")) resHeaders.set("x-proxy-render", "fetch");
+
+    clearTimeout(timer);
+    const finalRes = new NextResponse(body, {
+      status: upstreamRes.status,
+      headers: resHeaders,
+    });
+    attachSessionCookie(finalRes, sessionId);
+    return finalRes;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err instanceof Error && err.name === "AbortError") {
+      return json("Request timed out.", 504, sessionId);
+    }
+    const msg = err instanceof Error ? err.message : "Could not reach target URL.";
+    return json(msg, 502, sessionId);
+  }
+}
 }

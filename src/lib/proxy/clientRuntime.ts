@@ -160,7 +160,7 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         if (
           pHostname &&
           h === pHostname &&
-          (/^\\\/proxy(?:\\\/|$)/.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 || x.pathname === "/sw.js" || x.pathname === "/pwa.js")
+          (/^[/]proxy([/]|$) /.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 || x.pathname === "/sw.js" || x.pathname === "/pwa.js")
         ) {
 
           return x.href;
@@ -232,8 +232,11 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   if (typeof window !== "undefined" && typeof window.fetch === "function") {
     var f0 = window.fetch;
     window.fetch = function (i, init) {
-      if (typeof i === "string") {
-        var u1 = p(i);
+      var uArg = i;
+      if (uArg instanceof U0) uArg = uArg.href;
+      
+      if (typeof uArg === "string") {
+        var u1 = p(uArg);
         return f0.call(this, u1, init).then(function (res) {
           if (res && u1.indexOf("/api/front/batch/") !== -1) {
             try {
@@ -248,14 +251,10 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         var u2 = p(i.url);
         if (u2 === i.url) return f0.call(this, i, init);
         
-        // Create a new Request using the target URL and the original request as init.
-        // This natively copies the method, headers, body, etc.
-        // We must NOT manually extract the body, as that locks streams incorrectly.
         var newReq;
         try {
             newReq = new Request(u2, i);
         } catch(e) {
-            // Fallback for tricky bodies
             return f0.call(this, u2, init);
         }
         return f0.call(this, newReq, init).then(function (res) {
@@ -276,7 +275,10 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
     var o = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function () {
       var a = [].slice.call(arguments);
-      if (typeof a[1] === "string") a[1] = p(a[1]);
+      if (a[1] != null) {
+        if (a[1] instanceof U0) a[1] = p(a[1].href);
+        else if (typeof a[1] === "string") a[1] = p(a[1]);
+      }
       return o.apply(this, a);
     };
   }

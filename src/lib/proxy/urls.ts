@@ -89,9 +89,8 @@ export function isLikelyUrl(value: string): boolean {
   if (!t || t.length > 8_000) return false;
   if (/^#/.test(t)) return false;
   if (/^javascript:/i.test(t)) return false;
-  if (/^https?:\/\//i.test(t)) return true;
-  if (/^\/\//.test(t)) return true;
-  if (/^\/(?!\/)/.test(t)) return true; // same-origin path on target
-  if (/^\.\.?\//.test(t)) return true;
-  return false;
+  if (/^mailto:/i.test(t)) return false;
+  if (/^tel:/i.test(t)) return false;
+  if (/^data:/i.test(t)) return false;
+  return true;
 }
