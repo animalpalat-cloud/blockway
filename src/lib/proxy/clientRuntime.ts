@@ -226,30 +226,52 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   if (typeof window !== "undefined" && typeof window.fetch === "function") {
     var f0 = window.fetch;
     window.fetch = function (i, init) {
-      if (typeof i === "string") return f0.call(this, p(i), init);
-      if (typeof Request !== "undefined" && i && typeof i === "object" && i instanceof Request) {
-        var u2 = p(i.url);
-        if (u2 === i.url) return f0.call(this, i, init);
-        return f0.call(
-          this,
-          new Request(u2, {
-            method: i.method,
-            headers: i.headers,
-            body: i.body,
-            mode: i.mode,
-            credentials: i.credentials,
-            cache: i.cache,
-            redirect: i.redirect,
-            referrer: i.referrer,
-            integrity: i.integrity,
-            keepalive: i.keepalive,
-            signal: i.signal,
-            referrerPolicy: i.referrerPolicy
-          }),
-          init
-        );
+      var url, options = init || {};
+      if (typeof i === "string") {
+        url = p(i);
+      } else if (typeof Request !== "undefined" && i instanceof Request) {
+        url = p(i.url);
+        // If the URL didn't change, we can pass the Request object directly.
+        // This is crucial for avoiding "body already used" errors if the request has a stream body.
+        if (url === i.url) return f0.call(this, i, init);
+        
+        // Otherwise, we must clone the request properties.
+        // We use the Request constructor to clone most properties safely.
+        options = {};
+        for (var k in i) {
+          try { if (typeof i[k] !== 'function' && k !== 'url' && k !== 'bodyUsed') options[k] = i[k]; } catch(e){}
+        }
+        if (init) for (var k2 in init) options[k2] = init[k2];
+        
+        // If the request has a body and it hasn't been used, we must pass it.
+        if (i.body && !i.bodyUsed) {
+            options.body = i.body;
+        }
+      } else {
+        url = i;
       }
-      return f0.call(this, i, init);
+
+      return f0.call(this, url, options).then(function(res) {
+        // Fix Response cloning and URL property.
+        // We wrap the response to mask the proxy URL if possible, or at least 
+        // ensure that .clone() works as expected.
+        try {
+          var proxyUrl = res.url;
+          var targetUrl = (function() {
+            try {
+              var u = new U0(proxyUrl);
+              var t = u.searchParams.get('url');
+              return t ? decodeURIComponent(t) : proxyUrl;
+            } catch(e) { return proxyUrl; }
+          })();
+
+          // Define 'url' property if it differs
+          if (proxyUrl !== targetUrl) {
+            Object.defineProperty(res, 'url', { get: function() { return targetUrl; }, configurable: true });
+          }
+        } catch(e) {}
+        return res;
+      });
     };
   }
 

@@ -63,17 +63,30 @@ export function pickUserAgentForUpstream(): string {
  */
 export function pickSecChUa(ua: string): Record<string, string> {
   const isEdge = ua.includes("Edg/");
-  const m = ua.match(/Chrome\/(\d+)/);
+  const m = ua.match(/Chrome\/(\d+)\.(\d+)\.(\d+)\.(\d+)/) || ua.match(/Chrome\/(\d+)/);
   const version = m ? m[1] : "131";
+  const fullVersion = m && m[0] ? m[0].split('/')[1] : `${version}.0.0.0`;
   
   const brands = isEdge 
     ? `"Not A(Brand";v="99", "Microsoft Edge";v="${version}", "Chromium";v="${version}"`
     : `"Not A(Brand";v="99", "Google Chrome";v="${version}", "Chromium";v="${version}"`;
 
+  const fullBrands = isEdge
+    ? `"Not A(Brand";v="99.0.0.0", "Microsoft Edge";v="${fullVersion}", "Chromium";v="${fullVersion}"`
+    : `"Not A(Brand";v="99.0.0.0", "Google Chrome";v="${fullVersion}", "Chromium";v="${fullVersion}"`;
+
+  const platform = ua.includes("Windows") ? '"Windows"' : ua.includes("Mac") ? '"macOS"' : '"Linux"';
+  const platformVersion = ua.includes("Windows") ? '"15.0.0"' : '"14.5.0"';
+
   return {
     "sec-ch-ua": brands,
     "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": ua.includes("Windows") ? '"Windows"' : ua.includes("Mac") ? '"macOS"' : '"Linux"'
+    "sec-ch-ua-platform": platform,
+    "sec-ch-ua-full-version-list": fullBrands,
+    "sec-ch-ua-platform-version": platformVersion,
+    "sec-ch-ua-bitness": '"64"',
+    "sec-ch-ua-arch": '"x86"',
+    "sec-ch-ua-model": '""',
   };
 }
 
@@ -173,7 +186,7 @@ export function buildSecFetchHeaders(
       "sec-fetch-dest": "document",
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": fetchSite,
-      "sec-fetch-user": user,
+      "sec-fetch-user": "?1", // Document navigations usually have user gesture
     };
   }
 
@@ -194,12 +207,24 @@ export function buildSecFetchHeaders(
     };
   }
 
+  // API calls, XHR, Fetch
   return {
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": site,
     "sec-fetch-user": user,
   };
+}
+
+export function pickPriorityHeader(kind: InferredResourceKind): string {
+  switch (kind) {
+    case "document": return "u=0, i";
+    case "style": return "u=0, i";
+    case "script": return "u=1";
+    case "font": return "u=0, i";
+    case "image": return "u=2, i";
+    default: return "u=4";
+  }
 }
 
 const ACCEPT_LANG_POOL: readonly string[] = [

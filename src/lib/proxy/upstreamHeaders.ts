@@ -6,6 +6,7 @@ import {
   pickAcceptLanguage,
   pickUserAgentForUpstream,
   pickSecChUa,
+  pickPriorityHeader,
   DEFAULT_ACCEPT_ENCODING,
 } from "./browserHeaders";
 import { cookieHeaderForHost } from "./cookieJar";
@@ -101,6 +102,10 @@ export function buildUpstreamRequestHeaders(
   out.set("sec-fetch-mode", sec["sec-fetch-mode"]);
   out.set("sec-fetch-site", sec["sec-fetch-site"]);
   out.set("sec-fetch-user", sec["sec-fetch-user"]);
+  
+  // Modern Browser headers
+  out.set("priority", pickPriorityHeader(kind));
+  out.set("dnt", "1");
   if (target.protocol === "https:") {
     out.set("upgrade-insecure-requests", "1");
   }

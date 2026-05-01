@@ -40,26 +40,6 @@ const STRIP_FROM_RESPONSE = new Set([
 // ─── SSRF Protection ──────────────────────────────────────────────────────────
 const BLOCKED_PROTOCOLS = new Set(['file:', 'ftp:', 'ws:', 'wss:', 'data:', 'javascript:', 'gopher:', 'blob:']);
 
-function isPrivateIp(hostname) {
-    // Block raw IPv6 loopback
-    if (hostname === '::1' || hostname === '0:0:0:0:0:0:0:1') return true;
-
-    // Validate IPv4 format before numeric checks
-    if (!net.isIPv4(hostname)) return false;
-
-    const parts = hostname.split('.').map(Number);
-    const [a, b] = parts;
-
-    if (a === 127) return true;                              // 127.x.x.x loopback
-    if (a === 10) return true;                               // 10.0.0.0/8
-    if (a === 172 && b >= 16 && b <= 31) return true;        // 172.16.0.0/12
-    if (a === 192 && b === 168) return true;                 // 192.168.0.0/16
-    if (a === 169 && b === 254) return true;                 // 169.254.0.0/16 link-local
-    if (a === 0) return true;                                // 0.x.x.x
-    if (hostname === '255.255.255.255') return true;         // broadcast
-
-    return false;
-}
 
 function isBlockedTarget(parsed) {
     if (!parsed) return true;
@@ -67,9 +47,29 @@ function isBlockedTarget(parsed) {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return true;
 
     const h = parsed.hostname.toLowerCase();
-    if (['localhost', '0.0.0.0'].includes(h)) return true;
-    if (h.endsWith('.local') || h.endsWith('.internal')) return true;
-    if (isPrivateIp(h)) return true;
+    
+    // 1. Literal hostnames
+    if (['localhost', '127.0.0.1', '0.0.0.0', '::1', '::', '0:0:0:0:0:0:0:1'].includes(h)) return true;
+    if (h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.test') || h.endsWith('.invalid')) return true;
+
+    // 2. IPv4 Decimal/Hex/Octal bypass protection & private ranges
+    // Node's new URL() normalizes most of these to dotted-quad.
+    const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (m) {
+        const a = +m[1], b = +m[2];
+        if (a === 127 || a === 10 || a === 0) return true;
+        if (a === 172 && b >= 16 && b <= 31) return true;
+        if (a === 192 && b === 168) return true;
+        if (a === 169 && b === 254) return true;
+        if (a >= 224) return true; // Multicast
+    }
+
+    // 3. IPv6 Private/Reserved ranges
+    if (h.startsWith('[') && h.endsWith(']')) {
+        const v6 = h.slice(1, -1);
+        if (v6 === '::1' || v6 === '::') return true;
+        if (v6.startsWith('fe80:') || v6.startsWith('fc00:') || v6.startsWith('fd00:')) return true;
+    }
 
     return false;
 }
@@ -345,19 +345,43 @@ app.options('*', (req, res) => {
 // ─── Proxy Handler ─────────────────────────────────────────────────────────────
 app.all(PROXY_PATH, (req, res) => {
     // ── 1. Parse & validate target URL ──────────────────────────────────────────
-    const rawTarget = req.query.url;
+    // Robust URL extraction: We look for the first occurrence of '?url=' in the 
+    // original URL to avoid Express's automatic decoding/splitting of parameters.
+    let rawTarget = '';
+    const urlIdx = req.originalUrl.indexOf('url=');
+    if (urlIdx !== -1) {
+        const afterUrl = req.originalUrl.slice(urlIdx + 4);
+        // Split at the first '&ref=' if it exists (internal proxy param)
+        const refIdx = afterUrl.indexOf('&ref=');
+        rawTarget = refIdx !== -1 ? afterUrl.slice(0, refIdx) : afterUrl;
+        try {
+            rawTarget = decodeURIComponent(rawTarget);
+        } catch (e) {
+            // Fallback to Express query param if decodeURIComponent fails
+            rawTarget = req.query.url;
+        }
+    } else {
+        rawTarget = req.query.url;
+    }
+
     if (!rawTarget) {
         return res.status(400).json({ error: 'Missing ?url= query parameter.' });
     }
 
-    // Fix 1: URL Encoding – rawTarget from the query string is already decoded by
-    // Express. Re-encode it to handle any special characters in the original URL's
-    // path or query string before constructing the upstream request.
     let targetParsed;
     try {
         targetParsed = new url.URL(rawTarget);
     } catch {
-        return res.status(400).json({ error: 'Invalid target URL.' });
+        // Try fixing common missing-protocol cases
+        if (!rawTarget.includes('://')) {
+            try {
+                targetParsed = new url.URL('https://' + rawTarget);
+            } catch {
+                return res.status(400).json({ error: 'Invalid target URL.' });
+            }
+        } else {
+            return res.status(400).json({ error: 'Invalid target URL.' });
+        }
     }
 
     // Fix 5: SSRF Protection

@@ -49,17 +49,36 @@ export function normalizeUrl(input: string): URL | null {
 export function isBlockedTarget(url: URL): boolean {
   if (BLOCKED_PROTOCOLS.has(url.protocol)) return true;
   if (url.protocol !== "http:" && url.protocol !== "https:") return true;
+
   const h = url.hostname.toLowerCase();
-  if (["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(h)) return true;
-  if (h.endsWith(".local")) return true;
+  
+  // 1. Literal hostnames
+  if (["localhost", "127.0.0.1", "0.0.0.0", "::1", "::", "0:0:0:0:0:0:0:1"].includes(h)) return true;
+  if (h.endsWith(".local") || h.endsWith(".internal") || h.endsWith(".test") || h.endsWith(".invalid") || h.endsWith(".example")) return true;
+
+  // 2. IPv4 Decimal/Hex/Octal bypass protection
+  // Node's new URL() normalizes most of these to dotted-quad, so we check the result.
   const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (m) {
-    const a = +m[1], b = +m[2];
-    if (a === 10) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 169 && b === 254) return true;
+    const a = +m[1], b = +m[2], c = +m[3], d = +m[4];
+    if (a === 127) return true; // 127.0.0.0/8
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16
+    if (a === 0) return true; // 0.0.0.0/8
+    if (a >= 224) return true; // Multicast/Reserved
   }
+
+  // 3. IPv6 Private/Reserved ranges
+  if (h.startsWith("[") && h.endsWith("]")) {
+    const v6 = h.slice(1, -1);
+    if (v6 === "::1" || v6 === "::") return true;
+    if (v6.startsWith("fe80:")) return true; // Link-local
+    if (v6.startsWith("fc00:") || v6.startsWith("fd00:")) return true; // Unique local
+    if (v6.startsWith("ff00:")) return true; // Multicast
+  }
+
   return false;
 }
 
