@@ -1,9 +1,7 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  // Allow Next.js route handlers to return large proxied pages (up to 20 MB).
+const nextConfig = {
+  // دیگر کنفیگریشن...
   experimental: {
-    reactCompiler: true,
+    // reactCompiler: true, <-- اس لائن کو ختم کر دیں
     serverActions: {
       bodySizeLimit: "20mb",
     },
