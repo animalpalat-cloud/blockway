@@ -181,19 +181,16 @@ export async function doProxy(
     { sessionId, jarHost, documentReferer },
   );
 
+  try {
     const methodsWithBody = ["POST", "PUT", "PATCH", "DELETE"];
     let reqBody: Buffer | undefined = overrideBody;
-    
+
     if (!reqBody && methodsWithBody.includes(method)) {
         try {
             reqBody = Buffer.from(await request.arrayBuffer());
         } catch (e) {
             // Body might be already consumed or empty
         }
-    }
-
-    if (apiLike || method === "POST") {
-
     }
 
     // Call target directly via SOCKS5 proxy
