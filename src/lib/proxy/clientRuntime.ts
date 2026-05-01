@@ -152,16 +152,12 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
           h === pHostname &&
           (/^\\\/proxy(?:\\\/|$)/.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 || x.pathname === "/sw.js" || x.pathname === "/pwa.js")
         ) {
-          // #region agent log
-          fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451",{method:"POST",headers:{"Content-Type":"application/json","X-Debug-Session-Id":"caef94"},body:JSON.stringify({sessionId:"caef94",runId:"run1",hypothesisId:"H5",location:"src/lib/proxy/clientRuntime.ts:p",message:"same-host URL bypassed proxy rewrite",data:{input:String(u).slice(0,220),resolved:x.href.slice(0,220)},timestamp:Date.now()})}).catch(function(){});
-          // #endregion
+
           return x.href;
         }
       } catch (e7) {}
       if (/[()\\[\\]]/.test(x.href)) {
-        // #region agent log
-        fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451",{method:"POST",headers:{"Content-Type":"application/json","X-Debug-Session-Id":"caef94"},body:JSON.stringify({sessionId:"caef94",runId:"run1",hypothesisId:"H1",location:"src/lib/proxy/clientRuntime.ts:p",message:"proxy URL candidate has bracket/parenthesis chars",data:{resolved:x.href.slice(0,220),ref:r.slice(0,220)},timestamp:Date.now()})}).catch(function(){});
-        // #endregion
+
       }
       return "/proxy?url=" + strictEncode(x.href) + "&ref=" + strictEncode(r);
     } catch (e6) {
@@ -226,52 +222,24 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   if (typeof window !== "undefined" && typeof window.fetch === "function") {
     var f0 = window.fetch;
     window.fetch = function (i, init) {
-      var url, options = init || {};
-      if (typeof i === "string") {
-        url = p(i);
-      } else if (typeof Request !== "undefined" && i instanceof Request) {
-        url = p(i.url);
-        // If the URL didn't change, we can pass the Request object directly.
-        // This is crucial for avoiding "body already used" errors if the request has a stream body.
-        if (url === i.url) return f0.call(this, i, init);
+      if (typeof i === "string") return f0.call(this, p(i), init);
+      if (typeof Request !== "undefined" && i instanceof Request) {
+        var u2 = p(i.url);
+        if (u2 === i.url) return f0.call(this, i, init);
         
-        // Otherwise, we must clone the request properties.
-        // We use the Request constructor to clone most properties safely.
-        options = {};
-        for (var k in i) {
-          try { if (typeof i[k] !== 'function' && k !== 'url' && k !== 'bodyUsed') options[k] = i[k]; } catch(e){}
-        }
-        if (init) for (var k2 in init) options[k2] = init[k2];
-        
-        // If the request has a body and it hasn't been used, we must pass it.
-        if (i.body && !i.bodyUsed) {
-            options.body = i.body;
-        }
-      } else {
-        url = i;
-      }
-
-      return f0.call(this, url, options).then(function(res) {
-        // Fix Response cloning and URL property.
-        // We wrap the response to mask the proxy URL if possible, or at least 
-        // ensure that .clone() works as expected.
+        // Create a new Request using the target URL and the original request as init.
+        // This natively copies the method, headers, body, etc.
+        // We must NOT manually extract the body, as that locks streams incorrectly.
+        var newReq;
         try {
-          var proxyUrl = res.url;
-          var targetUrl = (function() {
-            try {
-              var u = new U0(proxyUrl);
-              var t = u.searchParams.get('url');
-              return t ? decodeURIComponent(t) : proxyUrl;
-            } catch(e) { return proxyUrl; }
-          })();
-
-          // Define 'url' property if it differs
-          if (proxyUrl !== targetUrl) {
-            Object.defineProperty(res, 'url', { get: function() { return targetUrl; }, configurable: true });
-          }
-        } catch(e) {}
-        return res;
-      });
+            newReq = new Request(u2, i);
+        } catch(e) {
+            // Fallback for tricky bodies
+            return f0.call(this, u2, init);
+        }
+        return f0.call(this, newReq, init);
+      }
+      return f0.call(this, i, init);
     };
   }
 
@@ -376,6 +344,17 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
   if (typeof HTMLAnchorElement !== "undefined") patch(HTMLAnchorElement.prototype, "href");
   if (typeof HTMLFormElement !== "undefined") patch(HTMLFormElement.prototype, "action");
   if (typeof HTMLAreaElement !== "undefined") patch(HTMLAreaElement.prototype, "href");
+
+  // SVG Elements
+  if (typeof SVGUseElement !== "undefined") {
+      patch(SVGUseElement.prototype, "href");
+      patch(SVGUseElement.prototype, "xlink:href");
+  }
+  if (typeof SVGImageElement !== "undefined") {
+      patch(SVGImageElement.prototype, "href");
+      patch(SVGImageElement.prototype, "xlink:href");
+  }
+
   if (typeof Element !== "undefined" && Element.prototype.setAttribute) {
     var sa = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function (n, v) {
@@ -474,6 +453,31 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
       Object.defineProperty(window, "origin", { configurable: true, get: function () { return P; } });
     }
   } catch (eW) {}
+  
+  // Navigator Spoofing
+  try {
+    if (typeof navigator !== "undefined") {
+      var ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+      Object.defineProperty(navigator, "userAgent", { get: function() { return ua; } });
+      Object.defineProperty(navigator, "appVersion", { get: function() { return ua.replace("Mozilla/", ""); } });
+      Object.defineProperty(navigator, "platform", { get: function() { return "Win32"; } });
+      if (navigator.userAgentData) {
+        Object.defineProperty(navigator, "userAgentData", { get: function() {
+          return {
+            brands: [
+              { brand: "Not A(Brand", version: "99" },
+              { brand: "Google Chrome", version: "131" },
+              { brand: "Chromium", version: "131" }
+            ],
+            mobile: false,
+            platform: "Windows",
+            getHighEntropyValues: function() { return Promise.resolve({}); }
+          };
+        }});
+      }
+    }
+  } catch (eNav) {}
+
   try {
     if (P) {
       var dPu = new U0(P + "/");
@@ -538,8 +542,14 @@ export function buildClientRuntimePatch(targetOrigin: string): string {
         (root.tagName === "IMG" && root.hasAttribute("src")) ||
         (root.tagName === "SCRIPT" && root.hasAttribute("src")) ||
         (root.tagName === "IFRAME" && root.hasAttribute("src")) ||
-        (root.tagName === "LINK" && root.hasAttribute("href")) ||
-        (root.tagName === "SOURCE" && (root.hasAttribute("src") || root.hasAttribute("srcset")))
+        (root.tagName === "SOURCE" && (root.hasAttribute("src") || root.hasAttribute("srcset"))) ||
+        (root.tagName === "VIDEO" && root.hasAttribute("src")) ||
+        (root.tagName === "AUDIO" && root.hasAttribute("src")) ||
+        (root.tagName === "EMBED" && root.hasAttribute("src")) ||
+        (root.tagName === "TRACK" && root.hasAttribute("src")) ||
+        (root.tagName === "INPUT" && root.hasAttribute("src")) ||
+        (root.tagName === "USE" && (root.hasAttribute("href") || root.hasAttribute("xlink:href"))) ||
+        (root.tagName === "IMAGE" && (root.hasAttribute("href") || root.hasAttribute("xlink:href")))
       ) {
         runMoAttr(root);
       }

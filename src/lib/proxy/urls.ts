@@ -20,21 +20,7 @@ export function proxyParamUrl(absolute: string, documentPageUrl?: string): strin
     }
   }
   if (/[()\[\]]/.test(absolute) || /[()]/.test(u)) {
-    // #region agent log
-    fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
-      body: JSON.stringify({
-        sessionId: "caef94",
-        runId: "run1",
-        hypothesisId: "H1",
-        location: "src/lib/proxy/urls.ts:proxyParamUrl",
-        message: "proxyParamUrl built URL with WAF-sensitive chars",
-        data: { absoluteSample: absolute.slice(0, 220), proxiedSample: u.slice(0, 220) },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
+
   }
   return u;
 }

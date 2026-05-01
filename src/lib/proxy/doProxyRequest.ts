@@ -111,23 +111,26 @@ export async function doProxy(
 ): Promise<NextResponse> {
   const sessionId = getSessionId(request);
 
-  const parsed = normalizeUrl(targetUrlStr);
+  // Manual URL extraction to avoid searchParams decoding
+  let rawUrl = targetUrlStr;
+  const fullUrl = request.url;
+  const urlIdx = fullUrl.indexOf("url=");
+  if (urlIdx !== -1) {
+    const afterUrl = fullUrl.slice(urlIdx + 4);
+    const refIdx = afterUrl.indexOf("&ref=");
+    const rawTarget = refIdx !== -1 ? afterUrl.slice(0, refIdx) : afterUrl;
+    try {
+      // Decode once. If client double-encoded (e.g. strictEncode), this restores the original encoded string.
+      // If they didn't, it restores the plain string.
+      rawUrl = decodeURIComponent(rawTarget);
+    } catch {
+      rawUrl = targetUrlStr;
+    }
+  }
+
+  const parsed = normalizeUrl(rawUrl);
   if (!parsed) {
-    // #region agent log
-    fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
-      body: JSON.stringify({
-        sessionId: "caef94",
-        runId: "run1",
-        hypothesisId: "H1",
-        location: "src/lib/proxy/doProxyRequest.ts:doProxy",
-        message: "normalizeUrl returned null",
-        data: { targetUrlStrSample: String(targetUrlStr).slice(0, 260), method },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
+
     return json("Invalid URL.", 400, sessionId);
   }
   if (isBlockedTarget(parsed)) {
@@ -184,29 +187,7 @@ export async function doProxy(
         : undefined;
 
     if (apiLike || method === "POST") {
-      // #region agent log
-      fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
-        body: JSON.stringify({
-          sessionId: "caef94",
-          runId: "run1",
-          hypothesisId: "H3",
-          location: "src/lib/proxy/doProxyRequest.ts:upstreamFetch",
-          message: "about to call target via SOCKS5 proxy",
-          data: {
-            method,
-            apiLike,
-            url: parsed.toString().slice(0, 260),
-            hasBody: !!reqBody,
-            bodyBytes: reqBody ? reqBody.length : 0,
-            referer: headers.get("referer"),
-            origin: headers.get("origin"),
-          },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {});
-      // #endregion
+
     }
 
     // Call target directly via SOCKS5 proxy
@@ -214,11 +195,15 @@ export async function doProxy(
       const isTargetHttps = parsed.protocol === 'https:';
       const requestModule = isTargetHttps ? https : http;
       
+      // Ensure outgoing path is safely encoded for strict CDNs
+      let safePath = parsed.pathname + parsed.search;
+      safePath = safePath.replace(/[()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+
       const proxyOptions = {
         method: method,
         hostname: parsed.hostname,
         port: parsed.port || (isTargetHttps ? 443 : 80),
-        path: parsed.pathname + parsed.search,
+        path: safePath,
         headers: Object.fromEntries(headers.entries()),
         agent: socksAgent,
         signal: controller.signal
@@ -313,26 +298,7 @@ export async function doProxy(
     }
   }
   if (apiLike && upstream.status >= 400) {
-    // #region agent log
-    fetch("http://127.0.0.1:7485/ingest/18796190-1e32-40e9-8ca0-68b2c2dd4451", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "caef94" },
-      body: JSON.stringify({
-        sessionId: "caef94",
-        runId: "run1",
-        hypothesisId: "H4",
-        location: "src/lib/proxy/doProxyRequest.ts:apiError",
-        message: "api-like upstream returned error",
-        data: {
-          status: upstream.status,
-          contentType: contentType.slice(0, 120),
-          finalUrl: finalUrl.slice(0, 260),
-          bodySample: buf.toString("utf-8", 0, 320),
-        },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
+
   }
 
   const resHeaders = new Headers();
@@ -341,6 +307,23 @@ export async function doProxy(
       resHeaders.set(key, value);
     }
   });
+
+  // Rewrite Location header for redirects so they stay within the proxy
+  const locationHeader = resHeaders.get("location");
+  if (locationHeader && !locationHeader.startsWith("/")) {
+    try {
+      // Handle both relative and absolute location headers
+      const absLocation = new URL(locationHeader, finalUrl).toString();
+      resHeaders.set("location", `/proxy?url=${encodeURIComponent(absLocation)}`);
+    } catch (e) {
+      // fallback
+    }
+  } else if (locationHeader && locationHeader.startsWith("/")) {
+      try {
+          const absLocation = new URL(locationHeader, finalUrl).toString();
+          resHeaders.set("location", `/proxy?url=${encodeURIComponent(absLocation)}`);
+      } catch (e) {}
+  }
 
   if (!apiLike && sniffHtml) {
     resHeaders.set("content-type", "text/html; charset=utf-8");

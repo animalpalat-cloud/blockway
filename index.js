@@ -81,6 +81,7 @@ const CHROME_LIKE_UAS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/131.0.0.0 Chrome/131.0.0.0 Safari/537.36',
 ];
 
 // These incoming headers are replaced with spoofed browser-like equivalents
@@ -113,7 +114,8 @@ function buildSpoofedHeaders(incoming, targetParsed, ref) {
 
     // 1. Pass through safe, non-revealing client headers
     Object.entries(incoming).forEach(([k, v]) => {
-        if (!INCOMING_STRIP.has(k.toLowerCase())) out[k] = v;
+        const l = k.toLowerCase();
+        if (!INCOMING_STRIP.has(l) && !l.startsWith('x-')) out[l] = v;
     });
 
     // 2. Rotate User-Agent
@@ -131,25 +133,30 @@ function buildSpoofedHeaders(incoming, targetParsed, ref) {
     } else if (kind === 'font') {
         out['accept'] = 'application/font-woff2;q=1.0,font/woff2;q=1.0,*/*;q=0.8';
     } else {
-        out['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
+        out['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
     }
 
     out['accept-language'] = 'en-US,en;q=0.9';
-    // Request uncompressed – simplifies proxy processing.
-    // We still decompress as a fallback if the server ignores this.
     out['accept-encoding'] = 'identity';
 
     // 4. Matching Sec-Ch-Ua client hints
-    const versionMatch = ua.match(/Chrome\/(\d+)/);
-    const version = versionMatch ? versionMatch[1] : '131';
-    out['sec-ch-ua'] = `"Not A(Brand";v="99", "Google Chrome";v="${version}", "Chromium";v="${version}"`;
+    const m = ua.match(/Chrome\/(\d+)\.(\d+)\.(\d+)\.(\d+)/) || ua.match(/Chrome\/(\d+)/);
+    const version = m ? m[1] : '131';
+    const fullVersion = m && m[0] ? m[0].split('/')[1] : `${version}.0.0.0`;
+    const isEdge = ua.includes('Edg/');
+
+    out['sec-ch-ua'] = isEdge
+        ? `"Not A(Brand";v="99", "Microsoft Edge";v="${version}", "Chromium";v="${version}"`
+        : `"Not A(Brand";v="99", "Google Chrome";v="${version}", "Chromium";v="${version}"`;
     out['sec-ch-ua-mobile'] = '?0';
     out['sec-ch-ua-platform'] = ua.includes('Windows') ? '"Windows"' : ua.includes('Mac') ? '"macOS"' : '"Linux"';
+    out['sec-ch-ua-full-version-list'] = isEdge
+        ? `"Not A(Brand";v="99.0.0.0", "Microsoft Edge";v="${fullVersion}", "Chromium";v="${fullVersion}"`
+        : `"Not A(Brand";v="99.0.0.0", "Google Chrome";v="${fullVersion}", "Chromium";v="${fullVersion}"`;
 
     // 5. Referer & Origin
-    // For subresources use target's own origin. For navigations, use ref if valid.
     let referer = `${targetParsed.origin}/`;
-    if (ref && kind === 'document') {
+    if (ref) {
         try {
             const refParsed = new url.URL(ref);
             if (refParsed.protocol === 'http:' || refParsed.protocol === 'https:') {
@@ -160,7 +167,7 @@ function buildSpoofedHeaders(incoming, targetParsed, ref) {
     out['referer'] = referer;
     out['origin']  = targetParsed.origin;
 
-    // 6. Sec-Fetch headers (context-appropriate)
+    // 6. Sec-Fetch headers
     if (kind === 'document') {
         out['sec-fetch-dest'] = 'document';
         out['sec-fetch-mode'] = 'navigate';
@@ -172,6 +179,11 @@ function buildSpoofedHeaders(incoming, targetParsed, ref) {
         out['sec-fetch-site'] = 'cross-site';
         out['sec-fetch-user'] = '?0';
     }
+
+    // 7. Modern Browser Extras
+    out['priority'] = kind === 'document' || kind === 'style' ? 'u=0, i' : kind === 'script' ? 'u=1' : 'u=2';
+    out['dnt'] = '1';
+    if (targetParsed.protocol === 'https:') out['upgrade-insecure-requests'] = '1';
 
     return out;
 }
@@ -410,7 +422,8 @@ app.all(PROXY_PATH, (req, res) => {
 
     // Fix 1 (cont): Build upstream path preserving the exact path + query from
     // the parsed URL object so special chars are properly percent-encoded.
-    const upstreamPath = targetParsed.pathname + targetParsed.search;
+    let upstreamPath = targetParsed.pathname + targetParsed.search;
+    upstreamPath = upstreamPath.replace(/[()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
     const options = {
         agent:   socksAgent,
@@ -451,8 +464,20 @@ app.all(PROXY_PATH, (req, res) => {
             // Build clean response headers
             const outHeaders = {};
             Object.entries(proxyRes.headers).forEach(([key, value]) => {
-                if (!STRIP_FROM_RESPONSE.has(key.toLowerCase())) outHeaders[key] = value;
+                if (!STRIP_FROM_RESPONSE.has(key.toLowerCase())) {
+                    outHeaders[key] = value;
+                }
             });
+
+            // Rewrite Location header for redirects so they stay within the proxy
+            const locationHeader = outHeaders['location'];
+            if (locationHeader) {
+                try {
+                    const finalUrl = targetParsed.toString();
+                    const absLocation = new url.URL(locationHeader, finalUrl).toString();
+                    outHeaders['location'] = `${PROXY_PATH}?url=${encodeURIComponent(absLocation)}`;
+                } catch (e) {}
+            }
 
             // Enforce CORS and correct content-type
             outHeaders['content-type']                    = contentType;
