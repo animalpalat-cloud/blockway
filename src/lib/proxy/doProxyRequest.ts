@@ -270,14 +270,7 @@ export async function doProxy(
       if (reqBody) req.write(reqBody);
       req.end();
     });
-  } catch (err) {
-    clearTimeout(timer);
-    if (err instanceof Error && err.name === "AbortError") {
-      return json("Request timed out.", 504, sessionId);
-    }
-    const msg = err instanceof Error ? err.message : "Could not reach target URL.";
-    return json(msg, 502, sessionId);
-  }
+
     absorbSetCookieHeaders(sessionId, jarHost, upstreamRes.headers);
 
     const resHeaders = new Headers();
@@ -358,5 +351,4 @@ export async function doProxy(
     const msg = err instanceof Error ? err.message : "Could not reach target URL.";
     return json(msg, 502, sessionId);
   }
-}
 }
