@@ -27,14 +27,46 @@ function jsonError(message: string, status: number) {
   return applyCors(NextResponse.json({ error: message }, { status }));
 }
 
+/**
+ * Extract the raw `url` query param without Next.js auto-decoding it a second time.
+ *
+ * WHY: Next.js searchParams.get("url") auto-decodes the value once.
+ * But our clientRuntime and sw.js encode target URLs with encodeURIComponent,
+ * so the raw query string contains url=https%3A%2F%2Fexample.com%2Fpath.
+ * Next.js decodes that to https://example.com/path — fine for simple URLs.
+ * BUT for URLs with encoded slashes or special chars inside paths
+ * (e.g. https%3A%2F%2Fxopen.com%2F becomes https://xopen.com/ and then
+ * Next.js may further mangle it), we lose the original structure → 400.
+ *
+ * SOLUTION: Read the raw request.url string, find url=..., decode exactly once.
+ */
+function extractTargetUrl(request: NextRequest): string {
+  // request.url is the full URL including origin and query string
+  const raw = request.url;
+  const qIdx = raw.indexOf("?");
+  if (qIdx === -1) return "";
+  const qs = raw.slice(qIdx + 1);
+  for (const part of qs.split("&")) {
+    if (part.startsWith("url=")) {
+      try {
+        return decodeURIComponent(part.slice(4));
+      } catch {
+        // If malformed encoding, return as-is
+        return part.slice(4);
+      }
+    }
+  }
+  return "";
+}
+
 export async function GET(request: NextRequest) {
-  const url = request.nextUrl.searchParams.get("url") ?? "";
+  const url = extractTargetUrl(request);
   if (!url.trim()) return jsonError("Missing url query parameter.", 400);
   return doProxy(request, url, "GET");
 }
 
 export async function POST(request: NextRequest) {
-  const qpUrl = request.nextUrl.searchParams.get("url")?.trim() ?? "";
+  const qpUrl = extractTargetUrl(request).trim();
   if (qpUrl) return doProxy(request, qpUrl, "POST");
   try {
     const body = (await request.json()) as { url?: string };
@@ -47,27 +79,25 @@ export async function POST(request: NextRequest) {
 }
 
 export async function HEAD(request: NextRequest) {
-  const url = request.nextUrl.searchParams.get("url") ?? "";
-  if (!url.trim()) {
-    return applyCors(new NextResponse(null, { status: 400 }));
-  }
+  const url = extractTargetUrl(request);
+  if (!url.trim()) return applyCors(new NextResponse(null, { status: 400 }));
   return doProxy(request, url, "HEAD");
 }
 
 export async function PUT(request: NextRequest) {
-  const url = request.nextUrl.searchParams.get("url") ?? "";
+  const url = extractTargetUrl(request);
   if (!url.trim()) return jsonError("Missing url query parameter.", 400);
   return doProxy(request, url, "PUT");
 }
 
 export async function PATCH(request: NextRequest) {
-  const url = request.nextUrl.searchParams.get("url") ?? "";
+  const url = extractTargetUrl(request);
   if (!url.trim()) return jsonError("Missing url query parameter.", 400);
   return doProxy(request, url, "PATCH");
 }
 
 export async function DELETE(request: NextRequest) {
-  const url = request.nextUrl.searchParams.get("url") ?? "";
+  const url = extractTargetUrl(request);
   if (!url.trim()) return jsonError("Missing url query parameter.", 400);
   return doProxy(request, url, "DELETE");
 }

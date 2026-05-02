@@ -24,11 +24,18 @@ const CORS_EXPOSE_HEADERS =
 
 type HttpMethod = "GET" | "POST" | "HEAD" | "PUT" | "PATCH" | "DELETE";
 
-function isApiLikeRequest(request: NextRequest, target: URL): boolean {
-  const p = target.pathname.toLowerCase();
-  if (p.startsWith("/api/") || p.includes("/api/")) return true;
+/**
+ * Detect if the proxied request is an API/XHR call (returns JSON) rather than
+ * a navigable HTML page.
+ *
+ * IMPORTANT: We ONLY check the *incoming request headers* from the browser,
+ * NOT the target URL path. Checking target.pathname for "/api/" was wrong —
+ * it would block legitimate API calls on the target site (e.g. xopen.com/api/front/batch)
+ * returning 403, which is exactly the error we saw in the console.
+ */
+function isApiLikeRequest(request: NextRequest): boolean {
   const accept = (request.headers.get("accept") || "").toLowerCase();
-  if (accept.includes("application/json")) return true;
+  if (accept.includes("application/json") && !accept.includes("text/html")) return true;
   const ctype = (request.headers.get("content-type") || "").toLowerCase();
   if (ctype.includes("application/json")) return true;
   const xhr = (request.headers.get("x-requested-with") || "").toLowerCase();
@@ -105,9 +112,9 @@ export async function doProxy(
     request.nextUrl.searchParams.get("ref"),
   );
   const maxBytes = MAX_SIZE_MB * 1024 * 1024;
-  const apiLike = isApiLikeRequest(request, parsed);
+  const apiLike = isApiLikeRequest(request);
 
-  // Puppeteer path — for JS-heavy sites (YouTube, Reddit, etc.)
+  // Puppeteer path — for JS-heavy sites
   if (method === "GET" && shouldRenderHtmlWithPuppeteer(request, parsed)) {
     try {
       const r = await renderWithPuppeteer(
@@ -143,8 +150,8 @@ export async function doProxy(
 
     upstream = await fetch(parsed.toString(), {
       method,
-      redirect:   "follow",
-      signal:     controller.signal,
+      redirect: "follow",
+      signal:   controller.signal,
       headers,
       body,
     });
@@ -160,7 +167,6 @@ export async function doProxy(
 
   absorbSetCookieHeaders(sessionId, jarHost, upstream.headers);
 
-  // Check content-length early to reject oversized responses
   const cl = Number(upstream.headers.get("content-length") ?? 0);
   if (cl && cl > maxBytes) return json("Response too large.", 413, sessionId);
 
@@ -177,6 +183,7 @@ export async function doProxy(
   const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
   const isCss  = ct.includes("text/css");
 
+  // Only rewrite HTML for non-API navigation responses
   const sniffHtml =
     (!apiLike && isHtml) ||
     (!apiLike && ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
@@ -188,7 +195,7 @@ export async function doProxy(
     responseBody = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
   }
 
-  // Build response headers
+  // Build response headers — strip security headers that would break the proxy
   const resHeaders = new Headers();
   upstream.headers.forEach((value, key) => {
     if (!STRIP_FROM_RESPONSE.has(key.toLowerCase())) {
@@ -196,7 +203,6 @@ export async function doProxy(
     }
   });
 
-  // Force correct content types for rewritten resources
   if (!apiLike && sniffHtml) {
     resHeaders.set("content-type", "text/html; charset=utf-8");
   } else if (!apiLike && isCss) {
@@ -204,12 +210,9 @@ export async function doProxy(
   }
 
   resHeaders.set("x-proxy-render", "fetch");
-
-  // Always strip CSP — our injected scripts need to run
   resHeaders.delete("content-security-policy");
   resHeaders.delete("content-security-policy-report-only");
 
-  // Prevent downstream caching of proxied content
   resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
   resHeaders.set("pragma", "no-cache");
   resHeaders.delete("age");
@@ -219,7 +222,6 @@ export async function doProxy(
   resHeaders.set("x-proxy-final-url", finalUrl);
   resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
 
-  // Must remove these — body may be rewritten/differently sized
   resHeaders.delete("content-length");
   resHeaders.delete("content-encoding");
   resHeaders.delete("transfer-encoding");
