@@ -1,8 +1,6 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  reactCompiler: true,
-
   experimental: {
     serverActions: {
       bodySizeLimit: "32mb",   // match PROXY_MAX_SIZE_MB

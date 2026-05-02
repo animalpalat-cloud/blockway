@@ -147,8 +147,6 @@ export async function doProxy(
       signal:     controller.signal,
       headers,
       body,
-      // @ts-expect-error — Node.js 18+ fetch supports keepalive
-      keepalive:  false,
     });
   } catch (err) {
     clearTimeout(timer);
