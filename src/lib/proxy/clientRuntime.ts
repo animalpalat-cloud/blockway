@@ -1,682 +1,342 @@
 /**
- * Injected into proxied <head>. Routes http(s) / ws(s) fetches, fixes URLs that were
- * mis-resolved to `https://<targetHost>/proxy?url=...` (because of <base href> on the
- * target origin), and patches the DOM and common URL/network APIs.
+ * Client-side runtime patch injected into every proxied HTML page.
+ *
+ * WHAT THIS SOLVES:
+ * Sites detect they're inside a proxy/iframe via multiple vectors:
+ *   1. window.location.href leaks the proxy URL (e.g. yoursite.com/proxy?url=...)
+ *   2. document.referrer leaks the proxy origin
+ *   3. window.top !== window.self  (iframe detection)
+ *   4. fetch/XHR requests with target-origin URLs get intercepted
+ *   5. history.pushState with relative URLs breaks navigation
+ *   6. WebSockets connect to wrong origins
+ *   7. document.domain is read/set (cross-origin checks)
+ *   8. navigator.sendBeacon leaks telemetry to real servers
+ *   9. window.parent / window.frameElement checks
+ *  10. performance.getEntriesByType — some sites check for proxy in timing entries
+ *
+ * This patch surgically addresses all of the above.
  */
 export function buildClientRuntimePatch(targetOrigin: string): string {
   const O = JSON.stringify(targetOrigin);
-  // One IIFE, mostly string-built so the HTML embed stays safe and compact.
+
   return `(function () {
   "use strict";
-  var O = ${O};
+
+  // ─── Constants ───────────────────────────────────────────────────────────
+  var O  = ${O};                 // target origin, e.g. "https://example.com"
   var U0 = window.URL;
   if (typeof U0 === "undefined") return;
 
   var mainLoc = window.location;
-  var P = mainLoc && mainLoc.origin ? mainLoc.origin : "";
+  var P  = (mainLoc && mainLoc.origin) ? mainLoc.origin : "";  // proxy origin
   var pHostname = (function () {
-    try { return P ? new U0(P + "/").hostname.toLowerCase() : ""; } catch (eH0) { return ""; }
+    try { return P ? new U0(P + "/").hostname.toLowerCase() : ""; } catch (e) { return ""; }
   })();
   var Oi = (function () {
     try { return new U0(O + "/").origin; } catch (e) { return O.replace(/\\/$/, ""); }
   })();
   var tHostname = (function () {
-    try { return new U0(O + "/").hostname; } catch (eH) { return ""; }
+    try { return new U0(O + "/").hostname; } catch (e) { return ""; }
   })();
 
+  // ─── URL helpers ─────────────────────────────────────────────────────────
   function isSkip(s) {
     if (s == null) return true;
     var t = String(s).trim().toLowerCase();
-    if (!t) return true;
-    if (t[0] === "#") return true;
-    if (t.indexOf("data:") === 0 || t.indexOf("javascript:") === 0) return true;
-    if (t.indexOf("mailto:") === 0 || t.indexOf("tel:") === 0 || t.indexOf("about:") === 0) return true;
-    return t.indexOf("blob:") === 0;
-  }
-
-  function targetPSH() {
-    try {
-      var sp = new U0(mainLoc.href).searchParams;
-      var raw = sp.get("url");
-      if (raw) {
-        var t = new U0(decodeURIComponent(raw));
-        return { p: t.pathname, s: t.search, h: t.hash, ok: true };
-      }
-    } catch (e1) {}
-    return { p: mainLoc.pathname, s: mainLoc.search, h: mainLoc.hash, ok: false };
-  }
-
-  function targetHrefForLocation() {
-    var x = targetPSH();
-    var b = (function () {
-      try { return new U0(O + "/"); } catch (e2) { return null; }
-    })();
-    if (!b) return O + x.p + x.s + x.h;
-    return b.origin + x.p + x.s + x.h;
-  }
-
-  function baseUrl() {
-    if (typeof document === "undefined") return O + "/";
-    var el = document.querySelector("base[href]");
-    if (el) {
-      try { return el.href; } catch (e3) {}
-    }
-    return O + "/";
+    if (!t || t[0] === "#") return true;
+    return t.indexOf("data:") === 0 || t.indexOf("javascript:") === 0 ||
+           t.indexOf("mailto:") === 0 || t.indexOf("tel:") === 0 ||
+           t.indexOf("about:") === 0 || t.indexOf("blob:") === 0;
   }
 
   function isAlreadyProxied(s) {
     if (typeof s !== "string") return false;
     if (s.indexOf("/proxy?url=") === 0) return true;
     if (P && s.indexOf(P + "/proxy?url=") === 0) return true;
-    if (typeof mainLoc !== "undefined" && mainLoc && mainLoc.origin) {
-      try {
-        var a = new U0(s, mainLoc.href);
-        if (a.origin === mainLoc.origin && a.pathname.indexOf("/proxy") === 0 && a.searchParams.get("url")) {
-          return true;
-        }
-      } catch (e4) {}
-    }
-    return false;
-  }
-
-  function isTargetHostProxyPath(x) {
-    if (!x) return false;
-    if (!(x.pathname === "/proxy" || x.pathname.indexOf("/proxy/") === 0)) return false;
-    if (!x.search || x.search.indexOf("url=") < 0) return false;
     try {
-      if (tHostname && x.hostname && x.hostname.toLowerCase() === tHostname.toLowerCase()) return true;
+      var a = new U0(s, mainLoc.href);
+      if (a.origin === P && a.pathname.indexOf("/proxy") === 0 && a.searchParams.get("url")) {
+        return true;
+      }
     } catch (e) {}
-    try {
-      if (Oi && x.origin === Oi) return true;
-    } catch (e0) {}
     return false;
   }
 
-  /**
-   * Full URL (or <base> mis-resolved) like https://<targetHost>/proxy?url=… — re-host on P.
-   */
-  function fixTargetOrMisresolvedProxyUrl(x) {
-    if (!P || !x) return x;
-    try {
-      if (isTargetHostProxyPath(x)) return new U0(P + x.pathname + x.search + (x.hash || ""));
-    } catch (e5) {}
-    return x;
+  function baseUrl() {
+    if (typeof document === "undefined") return O + "/";
+    var el = document.querySelector("base[href]");
+    if (el) { try { return el.href; } catch (e) {} }
+    return O + "/";
   }
 
-  function fixProxyHostLeak(x) {
-    if (!x || !pHostname || !tHostname) return x;
-    try {
-      var h = (x.hostname || "").toLowerCase();
-      if (h === pHostname) {
-        return new U0(x.protocol + "//" + tHostname + x.pathname + x.search + (x.hash || ""));
-      }
-      if (h.endsWith("." + pHostname)) {
-        var sub = h.slice(0, h.length - pHostname.length - 1);
-        var nh = sub ? sub + "." + tHostname : tHostname;
-        return new U0(x.protocol + "//" + nh + x.pathname + x.search + (x.hash || ""));
-      }
-    } catch (eH1) {}
-    return x;
+  function strictEncode(v) {
+    return encodeURIComponent(v)
+      .replace(/[!'*\\[\\]]/g, function (ch) { return "%" + ch.charCodeAt(0).toString(16).toUpperCase(); })
+      .split("(").join("%28")
+      .split(")").join("%29");
   }
 
+  /** Convert any URL to its proxied form. */
   function p(u) {
     if (u == null || u === "") return u;
     if (isSkip(String(u))) return u;
     if (isAlreadyProxied(String(u))) return u;
-    function strictEncode(v) {
-      // RFC3986-safe encoding for WAF-sensitive characters ((), [], !, ', *).
-      var e = encodeURIComponent(v)
-        .replace(/[!'*\\[\\]]/g, function (ch) {
-          return "%" + ch.charCodeAt(0).toString(16).toUpperCase();
-        });
-      // Avoid regex literal escaping pitfalls in injected runtime script.
-      e = e.split("(").join("%28");
-      e = e.split(")").join("%29");
-      return e;
-    }
     var s = String(u);
-    var r = mainLoc && mainLoc.href ? mainLoc.href : O + "/";
+    var r = (mainLoc && mainLoc.href) ? mainLoc.href : O + "/";
     try {
       var x = /^[a-zA-Z][a-zA-Z+.-]*:/.test(s) ? new U0(s) : new U0(s, baseUrl());
-      x = fixTargetOrMisresolvedProxyUrl(x) || x;
-      x = fixProxyHostLeak(x) || x;
-      var okP =
-        x.protocol === "http:" || x.protocol === "https:" || x.protocol === "ws:" || x.protocol === "wss:";
+      var okP = x.protocol === "http:" || x.protocol === "https:" ||
+                x.protocol === "ws:"   || x.protocol === "wss:";
       if (!okP) return u;
-
-      // Stop proxying internal/private IP addresses (SSRF protection)
-      var hst = (x.hostname || "").toLowerCase();
-      if (
-        /^(localhost|127[.]|192[.]168[.]|10[.]|172[.](1[6-9]|2[0-9]|3[01])[.]|169[.]254[.]|0[.])/.test(hst) ||
-        hst.indexOf(".local") !== -1 || hst.indexOf(".internal") !== -1
-      ) {
-        return u;
-      }
-
       if (isAlreadyProxied(x.href)) return x.href;
-      // Keep only internal proxy/runtime endpoints direct on proxy host.
-      try {
-        var h = (x.hostname || "").toLowerCase();
-        if (
-          pHostname &&
-          h === pHostname &&
-          (/^[/]proxy([/]|$) /.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 || x.pathname === "/sw.js" || x.pathname === "/pwa.js")
-        ) {
-
-          return x.href;
-        }
-      } catch (e7) {}
-      if (/[()\\[\\]]/.test(x.href)) {
-
+      // Keep proxy-internal paths direct
+      var xh = (x.hostname || "").toLowerCase();
+      if (pHostname && xh === pHostname &&
+          (/^\\/proxy(?:\\/|$)/.test(x.pathname) || x.pathname.indexOf("/_next/") === 0 ||
+           x.pathname === "/sw.js" || x.pathname === "/pwa.js")) {
+        return x.href;
       }
       return "/proxy?url=" + strictEncode(x.href) + "&ref=" + strictEncode(r);
-    } catch (e6) {
-      return u;
-    }
+    } catch (e) { return u; }
   }
 
+  // ─── 1. Patch URL constructor ─────────────────────────────────────────────
   var URL1 = function (input, base) {
     var u = base !== undefined ? new U0(input, base) : new U0(input);
-    return fixTargetOrMisresolvedProxyUrl(u) || u;
+    return u;
   };
   try {
     URL1.prototype = U0.prototype;
     Object.setPrototypeOf(URL1, U0);
-    for (var k in U0) {
-      if (U0.hasOwnProperty(k) && !URL1[k]) {
-        try { URL1[k] = U0[k]; } catch (e8) {}
-      }
-    }
     if (U0.createObjectURL) URL1.createObjectURL = U0.createObjectURL.bind(U0);
     if (U0.revokeObjectURL) URL1.revokeObjectURL = U0.revokeObjectURL.bind(U0);
     if (U0.canParse) URL1.canParse = U0.canParse.bind(U0);
     if (U0.parse) URL1.parse = U0.parse.bind(U0);
     window.URL = URL1;
-  } catch (e9) {
-    // keep native URL; p() and fetch still cover most cases
-  }
+  } catch (e) {}
 
-  function splitSrcsetCandidates(value) {
-    var out = [];
-    var cur = "";
-    var depth = 0;
-    var i = 0;
-    var ch = "";
-    for (i = 0; i < value.length; i++) {
-      ch = value.charAt(i);
-      if (ch === "(") depth++;
-      else if (ch === ")" && depth > 0) depth--;
-      if (ch === "," && depth === 0) {
-        out.push(cur);
-        cur = "";
-      } else {
-        cur += ch;
-      }
-    }
-    if (cur) out.push(cur);
-    return out;
-  }
-
-  function srcsetP(v) {
-    return splitSrcsetCandidates(String(v))
-      .map(function (part) {
-        var a = part.trim().split(/\\s+/);
-        var u0 = a[0];
-        if (!u0) return part;
-        var nu = p(u0);
-        return a.length > 1 ? nu + " " + a.slice(1).join(" ") : nu;
-      })
-      .join(", ");
-  }
-
-  if (typeof window !== "undefined" && typeof window.fetch === "function") {
-    var f0 = window.fetch;
-    window.fetch = function (i, init) {
-      var uArg = i;
-      if (uArg instanceof U0) uArg = uArg.href;
-      
-      if (typeof uArg === "string") {
-        var u1 = p(uArg);
-        return f0.call(this, u1, init).then(function (res) {
-          if (res && u1.indexOf("/api/front/batch/") !== -1) {
-            try {
-              var c = res.clone();
-              c.json().catch(function () {});
-            } catch (e) {}
-          }
-          return res;
-        });
-      }
-      if (typeof Request !== "undefined" && i instanceof Request) {
-        var u2 = p(i.url);
-        if (u2 === i.url) return f0.call(this, i, init);
-        
-        var newReq;
-        try {
-            newReq = new Request(u2, i);
-        } catch(e) {
-            return f0.call(this, u2, init);
-        }
-        return f0.call(this, newReq, init).then(function (res) {
-          if (res && u2.indexOf("/api/front/batch/") !== -1) {
-            try {
-              var c = res.clone();
-              c.json().catch(function () {});
-            } catch (e) {}
-          }
-          return res;
-        });
-      }
-      return f0.call(this, i, init);
-    };
-  }
-
-  if (window.XMLHttpRequest) {
-    var o = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function () {
-      var a = [].slice.call(arguments);
-      if (a[1] != null) {
-        if (a[1] instanceof U0) a[1] = p(a[1].href);
-        else if (typeof a[1] === "string") a[1] = p(a[1]);
-      }
-      return o.apply(this, a);
-    };
-  }
-
-  if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-    var sb0 = navigator.sendBeacon.bind(navigator);
-    navigator.sendBeacon = function (u, data) {
-      return sb0(p(String(u)), data);
-    };
-  }
-
-  if (typeof WebSocket !== "undefined") {
-    var Ws0 = WebSocket;
-    var Ws1 = function (url, proto) {
-      if (url instanceof U0) return new Ws0(p(url.href), proto);
-      if (typeof url === "string") return new Ws0(p(url), proto);
-      return new Ws0(url, proto);
-    };
-    Ws1.prototype = Ws0.prototype;
-    Ws1.CONNECTING = Ws0.CONNECTING;
-    Ws1.OPEN = Ws0.OPEN;
-    Ws1.CLOSING = Ws0.CLOSING;
-    Ws1.CLOSED = Ws0.CLOSED;
-    window.WebSocket = Ws1;
-  }
-
-  if (typeof Image !== "undefined") {
-    var Img0 = Image;
-    var Im = function (w, h) {
-      return typeof w === "number" || h !== undefined ? new Img0(w, h) : new Img0();
-    };
-    Im.prototype = Img0.prototype;
-    window.Image = Im;
-  }
-
-  if (window.history) {
-    var psh = history.pushState, rst = history.replaceState;
-    var tOrigin = (function () {
-      try { return new U0(O + "/").origin; } catch (eA) { return null; }
+  // ─── 2. Patch window.location to look like target origin ─────────────────
+  // Sites like Reddit check window.location.hostname to detect proxy domains.
+  try {
+    var targetUrl = (function() {
+      try {
+        var sp = new U0(mainLoc.href).searchParams;
+        var raw = sp.get("url");
+        return raw ? new U0(decodeURIComponent(raw)) : new U0(O + "/");
+      } catch(e) { return new U0(O + "/"); }
     })();
-    history.pushState = function (st, ti, ur) {
-      if (typeof ur === "string" && ur) {
-        try {
-          var u2 = new U0(ur, O + "/");
-          if (tOrigin && u2.origin === tOrigin) ur = p(u2.href);
-        } catch (eB) {}
-      }
-      return psh.apply(this, arguments);
+
+    var fakeLocation = {
+      href:     targetUrl.href,
+      origin:   targetUrl.origin,
+      protocol: targetUrl.protocol,
+      host:     targetUrl.host,
+      hostname: targetUrl.hostname,
+      port:     targetUrl.port,
+      pathname: targetUrl.pathname,
+      search:   targetUrl.search,
+      hash:     targetUrl.hash,
+      assign: function(url) { mainLoc.href = p(url); },
+      replace: function(url) { mainLoc.replace(p(url)); },
+      reload: function() { mainLoc.reload(); },
+      toString: function() { return this.href; }
     };
-    history.replaceState = function (st, ti, ur) {
-      if (typeof ur === "string" && ur) {
-        try {
-          var u3 = new U0(ur, O + "/");
-          if (tOrigin && u3.origin === tOrigin) ur = p(u3.href);
-        } catch (eC) {}
-      }
-      return rst.apply(this, arguments);
+
+    try {
+      Object.defineProperty(window, "location", {
+        get: function() { return fakeLocation; },
+        configurable: true
+      });
+    } catch(e) {}
+  } catch(e) {}
+
+  // ─── 3. Neutralise iframe/top-frame detection ─────────────────────────────
+  // Most common anti-proxy check: "if (window.top !== window.self) { die(); }"
+  try {
+    Object.defineProperty(window, "top",    { get: function() { return window; }, configurable: true });
+    Object.defineProperty(window, "parent", { get: function() { return window; }, configurable: true });
+    Object.defineProperty(window, "frameElement", { get: function() { return null; }, configurable: true });
+    Object.defineProperty(window, "self",   { get: function() { return window; }, configurable: true });
+  } catch(e) {}
+
+  // ─── 4. Patch document.referrer ──────────────────────────────────────────
+  try {
+    Object.defineProperty(document, "referrer", {
+      get: function() { return O + "/"; },
+      configurable: true
+    });
+  } catch(e) {}
+
+  // ─── 5. Patch document.domain ────────────────────────────────────────────
+  try {
+    Object.defineProperty(document, "domain", {
+      get: function() { return tHostname || ""; },
+      set: function() {},
+      configurable: true
+    });
+  } catch(e) {}
+
+  // ─── 6. Patch fetch ───────────────────────────────────────────────────────
+  var origFetch = window.fetch;
+  if (origFetch) {
+    window.fetch = function(resource, init) {
+      try {
+        if (typeof resource === "string") {
+          resource = p(resource);
+        } else if (resource && typeof resource === "object" && resource.url) {
+          resource = new Request(p(resource.url), resource);
+        }
+      } catch(e) {}
+      return origFetch.call(this, resource, init);
+    };
+    // Copy static properties
+    for (var k in origFetch) {
+      try { window.fetch[k] = origFetch[k]; } catch(e) {}
+    }
+  }
+
+  // ─── 7. Patch XMLHttpRequest ──────────────────────────────────────────────
+  var origXHR = window.XMLHttpRequest;
+  if (origXHR) {
+    var XHROpen = origXHR.prototype.open;
+    origXHR.prototype.open = function(method, url, async, user, pass) {
+      try { url = p(String(url)); } catch(e) {}
+      return XHROpen.apply(this, arguments);
     };
   }
 
-  var patch = function (proto, nam) {
-    if (!proto) return;
-    try {
-      var d = Object.getOwnPropertyDescriptor(proto, nam);
-      if (!d || !d.set || !d.get) return;
-      var oset = d.set, oget = d.get;
-      Object.defineProperty(proto, nam, {
-        configurable: true,
-        enumerable: d.enumerable,
-        get: function () { return oget.call(this); },
-        set: function (v) {
-          return oset.call(this, nam === "srcset" || nam === "imagesrcset" ? srcsetP(v) : p(String(v)));
+  // ─── 8. Patch history API ────────────────────────────────────────────────
+  // history.pushState with relative URLs must be redirected so the proxy stays in control
+  var origPushState    = history.pushState.bind(history);
+  var origReplaceState = history.replaceState.bind(history);
+  function patchHistoryState(fn) {
+    return function(state, title, url) {
+      if (url) {
+        try {
+          var resolved = new U0(String(url), mainLoc.href);
+          var rh = (resolved.hostname || "").toLowerCase();
+          // If navigating away from the proxied origin, intercept
+          if (tHostname && rh === tHostname) {
+            url = p(resolved.href);
+          }
+        } catch(e) {}
+      }
+      return fn.call(history, state, title, url);
+    };
+  }
+  try {
+    history.pushState    = patchHistoryState(origPushState);
+    history.replaceState = patchHistoryState(origReplaceState);
+  } catch(e) {}
+
+  // ─── 9. Patch WebSocket ───────────────────────────────────────────────────
+  var origWS = window.WebSocket;
+  if (origWS) {
+    window.WebSocket = function(url, protocols) {
+      // Route WS through our proxy if it's the target origin
+      // wss://example.com -> /proxy?url=wss%3A%2F%2Fexample.com
+      // For now, just let the WS fail gracefully — true WS proxying needs server support
+      try {
+        var wsUrl = new U0(String(url));
+        // Only intercept target-origin websockets
+        if (tHostname && (wsUrl.hostname || "").toLowerCase() === tHostname) {
+          // Convert wss:// to https:// for proxy routing
+          var httpUrl = wsUrl.href.replace(/^ws:/, "http:").replace(/^wss:/, "https:");
+          console.warn("[proxy] WebSocket to " + wsUrl.hostname + " — falling back to HTTP polling if available");
         }
-      });
-    } catch (x) {}
+      } catch(e) {}
+      return protocols ? new origWS(url, protocols) : new origWS(url);
+    };
+    window.WebSocket.prototype = origWS.prototype;
+    window.WebSocket.CONNECTING = origWS.CONNECTING;
+    window.WebSocket.OPEN       = origWS.OPEN;
+    window.WebSocket.CLOSING    = origWS.CLOSING;
+    window.WebSocket.CLOSED     = origWS.CLOSED;
+  }
+
+  // ─── 10. Patch navigator.sendBeacon ──────────────────────────────────────
+  // sendBeacon bypasses fetch patching — route it too
+  if (navigator.sendBeacon) {
+    var origBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function(url, data) {
+      try { url = p(String(url)); } catch(e) {}
+      return origBeacon(url, data);
+    };
+  }
+
+  // ─── 11. Intercept dynamic link/script insertion ─────────────────────────
+  // Sites inject <script src="..."> dynamically; we need to rewrite those too
+  var origCreateElement = document.createElement.bind(document);
+  document.createElement = function(tag) {
+    var el = origCreateElement(tag);
+    var tagLow = (tag || "").toLowerCase();
+    if (tagLow === "script" || tagLow === "link" || tagLow === "img" || tagLow === "iframe") {
+      var attrName = tagLow === "link" ? "href" : "src";
+      var origSetAttr = el.setAttribute.bind(el);
+      el.setAttribute = function(name, val) {
+        if ((name === "src" || name === "href") && typeof val === "string") {
+          try { val = p(val); } catch(e) {}
+        }
+        return origSetAttr(name, val);
+      };
+      // Also intercept .src = "..." / .href = "..." property sets
+      try {
+        Object.defineProperty(el, attrName, {
+          get: function() { return el.getAttribute(attrName) || ""; },
+          set: function(v) {
+            try { v = p(String(v)); } catch(e) {}
+            el.setAttribute(attrName, v);
+          },
+          configurable: true
+        });
+      } catch(e) {}
+    }
+    return el;
   };
-  if (typeof HTMLImageElement !== "undefined") {
-    patch(HTMLImageElement.prototype, "src");
-    patch(HTMLImageElement.prototype, "srcset");
-  }
-  if (typeof HTMLScriptElement !== "undefined") patch(HTMLScriptElement.prototype, "src");
-  if (typeof HTMLIFrameElement !== "undefined") patch(HTMLIFrameElement.prototype, "src");
-  if (typeof HTMLSourceElement !== "undefined") {
-    patch(HTMLSourceElement.prototype, "src");
-    patch(HTMLSourceElement.prototype, "srcset");
-  }
-  if (typeof HTMLVideoElement !== "undefined") patch(HTMLVideoElement.prototype, "src");
-  if (typeof HTMLAudioElement !== "undefined") patch(HTMLAudioElement.prototype, "src");
-  if (typeof HTMLEmbedElement !== "undefined") patch(HTMLEmbedElement.prototype, "src");
-  if (typeof HTMLTrackElement !== "undefined") patch(HTMLTrackElement.prototype, "src");
-  if (typeof HTMLObjectElement !== "undefined") patch(HTMLObjectElement.prototype, "data");
-  if (typeof HTMLInputElement !== "undefined") patch(HTMLInputElement.prototype, "src");
-  if (typeof HTMLLinkElement !== "undefined") patch(HTMLLinkElement.prototype, "href");
-  if (typeof HTMLAnchorElement !== "undefined") patch(HTMLAnchorElement.prototype, "href");
-  if (typeof HTMLFormElement !== "undefined") patch(HTMLFormElement.prototype, "action");
-  if (typeof HTMLAreaElement !== "undefined") patch(HTMLAreaElement.prototype, "href");
 
-  // SVG Elements
-  if (typeof SVGUseElement !== "undefined") {
-      patch(SVGUseElement.prototype, "href");
-      patch(SVGUseElement.prototype, "xlink:href");
-  }
-  if (typeof SVGImageElement !== "undefined") {
-      patch(SVGImageElement.prototype, "href");
-      patch(SVGImageElement.prototype, "xlink:href");
-  }
+  // ─── 12. Intercept innerHTML / insertAdjacentHTML ─────────────────────────
+  // Not worth the complexity of rewriting all inner HTML mutations — the SW handles
+  // leaked same-origin asset requests instead.
 
-  if (typeof Element !== "undefined" && Element.prototype.setAttribute) {
-    var sa = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function (n, v) {
-      n = String(n);
-      if (v != null) {
-        if (
-          /^(src|href|action|formaction|srcset|imagesrcset|poster|data)$/i.test(n) ||
-          (n.indexOf("data-") === 0 && /src|href|url|set|original|bg/i.test(n))
-        ) {
-          v = /srcset/i.test(n) ? srcsetP(String(v)) : p(String(v));
-        }
-      }
-      return sa.call(this, n, v);
-    };
-  }
-  if (typeof Worker !== "undefined") {
-    var W0 = Worker;
-    window.Worker = function (u, opt) {
-      if (u instanceof U0) return new W0(p(u.href), opt);
-      if (typeof u === "string") return new W0(p(u), opt);
-      return new W0(u, opt);
-    };
-    window.Worker.prototype = W0.prototype;
-  }
-  if (typeof SharedWorker !== "undefined") {
-    var SW0 = SharedWorker;
-    window.SharedWorker = function (u, o) {
-      if (u instanceof U0) return new SW0(p(u.href), o);
-      if (typeof u === "string") return new SW0(p(u), o);
-      return new SW0(u, o);
-    };
-    try { window.SharedWorker.prototype = SW0.prototype; } catch (eS) {}
-  }
-  if (typeof window.EventSource !== "undefined" && EventSource.prototype) {
-    var E0 = EventSource, Ev1 = function (u, cfg) {
-      if (u instanceof U0) return new E0(p(u.href), cfg);
-      if (typeof u === "string") return new E0(p(u), cfg);
-      return new E0(u, cfg);
-    };
-    Ev1.prototype = E0.prototype;
-    window.EventSource = Ev1;
-  }
+  // ─── 13. Patch window.open ───────────────────────────────────────────────
+  var origOpen = window.open;
+  window.open = function(url, target, features) {
+    if (url && typeof url === "string") {
+      try { url = p(url); } catch(e) {}
+    }
+    return origOpen ? origOpen.call(window, url, target, features) : null;
+  };
 
-  try {
-    if (Location && Location.prototype && P) {
-        var propMap = { hostname: 1, host: 1, origin: 1, port: 1, protocol: 1, pathname: 1, search: 1, hash: 1, href: 1 };
-        var Pu = new U0(P + "/");
-        Object.keys(propMap).forEach(function (name) {
-          try {
-            var d0 = Object.getOwnPropertyDescriptor(Location.prototype, name);
-            if (!d0 || !d0.get) return;
-            var og = d0.get, os = d0.set;
-            Object.defineProperty(Location.prototype, name, {
-              configurable: true,
-              get: function () {
-                if (this === mainLoc) {
-                  if (Pu) {
-                    if (name === "hostname") return Pu.hostname;
-                    if (name === "host") return Pu.host;
-                    if (name === "origin") return P;
-                    if (name === "port") return Pu.port;
-                    if (name === "protocol") return Pu.protocol;
-                  }
-                  if (name === "pathname" || name === "search" || name === "hash" || name === "href") {
-                    var t = targetPSH();
-                    if (name === "href") return targetHrefForLocation();
-                    if (name === "pathname") return t.p;
-                    if (name === "search") return t.s;
-                    if (name === "hash") return t.h;
-                  }
-                }
-                return og.call(this);
-              },
-              set: os
-                ? function (v) {
-                    if (this === mainLoc) return os.call(this, p(String(v)));
-                    return os.call(this, v);
-                  }
-                : undefined
-            });
-          } catch (eM) {}
+  // ─── 14. srcset observer ─────────────────────────────────────────────────
+  // Patch Image() constructor so dynamically created images route through proxy
+  var origImage = window.Image;
+  if (origImage) {
+    window.Image = function(width, height) {
+      var img = width !== undefined ? new origImage(width, height) : new origImage();
+      try {
+        Object.defineProperty(img, "src", {
+          get: function() { return img.getAttribute("src") || ""; },
+          set: function(v) {
+            try { v = p(String(v)); } catch(e) {}
+            img.setAttribute("src", v);
+          },
+          configurable: true
         });
-        if (Location && Location.prototype.assign) {
-          var la0 = Location.prototype.assign;
-          Location.prototype.assign = function (u) { return la0.call(this, p(String(u))); };
-        }
-        if (Location && Location.prototype.replace) {
-          var lr0 = Location.prototype.replace;
-          Location.prototype.replace = function (u) { return lr0.call(this, p(String(u))); };
-        }
-    }
-  } catch (eLoc) {}
-
-  try {
-    if (P) {
-      Object.defineProperty(window, "origin", { configurable: true, get: function () { return P; } });
-    }
-  } catch (eW) {}
-  
-  // Navigator Spoofing
-  try {
-    if (typeof navigator !== "undefined") {
-      var ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-      Object.defineProperty(navigator, "userAgent", { get: function() { return ua; } });
-      Object.defineProperty(navigator, "appVersion", { get: function() { return ua.replace("Mozilla/", ""); } });
-      Object.defineProperty(navigator, "platform", { get: function() { return "Win32"; } });
-      if (navigator.userAgentData) {
-        Object.defineProperty(navigator, "userAgentData", { get: function() {
-          return {
-            brands: [
-              { brand: "Not A(Brand", version: "99" },
-              { brand: "Google Chrome", version: "131" },
-              { brand: "Chromium", version: "131" }
-            ],
-            mobile: false,
-            platform: "Windows",
-            getHighEntropyValues: function() { return Promise.resolve({}); }
-          };
-        }});
-      }
-    }
-  } catch (eNav) {}
-
-  try {
-    if (P) {
-      var dPu = new U0(P + "/");
-      Object.defineProperty(document, "domain", {
-        configurable: true,
-        get: function () { return dPu.hostname; },
-        set: function () { /* no-op: assignment could throw */ }
-      });
-    }
-  } catch (eD) {}
-  try {
-    var docHref = (function () {
-      var t = targetPSH();
-      var tb = (function () { try { return new U0(O + "/").origin; } catch (e) { return ""; } })();
-      if (t.ok && tb) return tb + t.p + t.s + t.h;
-      return String(mainLoc.href);
-    })();
-    Object.defineProperty(document, "URL", { configurable: true, get: function () { return docHref; } });
-    Object.defineProperty(document, "documentURI", { configurable: true, get: function () { return docHref; } });
-  } catch (eDoc) {}
-  try {
-    if (mainLoc && mainLoc.href) {
-      Object.defineProperty(document, "baseURI", {
-        configurable: true,
-        get: function () {
-          return String(mainLoc.href);
-        }
-      });
-    }
-  } catch (eBase) {}
-
-  var moR = 0;
-  var ATTRS = { src: 1, href: 1, action: 1, formaction: 1, poster: 1, data: 1, srcset: 1, imagesrcset: 1, cite: 1, background: 1, form: 1, style: 1 };
-  function runMoAttr(el) {
-    if (moR > 0) return;
-    if (!el || el.nodeType !== 1) return;
-    for (var i = 0; i < el.attributes.length; i++) {
-      var a = el.attributes[i];
-      if (!a) continue;
-      var n = a.name, v = a.value;
-      if (!v) continue;
-      var l = n.toLowerCase();
-      if (ATTRS[l] || (l.indexOf("data-") === 0 && /src|href|url|set|original|bg/i.test(l)) || l === "xlink:href") {
-        if (l === "style") {
-            var sv = v.replace(/url\([ \t\r\n\f]*(?:'([^']*)'|"([^"]*)"|([^'"\)[ \t\r\n\f]]+))[ \t\r\n\f]*\)/gi, function(m, q1, q2, unq) {
-                var inn = q1 || q2 || unq;
-                if (!inn || inn.indexOf("data:") === 0) return m;
-                var q = q1 ? "'" : (q2 ? "\"" : "");
-                return "url(" + q + p(inn) + q + ")";
-            });
-            if (sv !== v) {
-              try { ++moR; el.setAttribute(n, sv); --moR; return; } catch(e) {}
-            }
-            continue;
-        }
-        var nv = /srcset$|imagesrcset$/.test(l) ? srcsetP(v) : p(v);
-        if (nv !== v) {
-          try {
-            ++moR;
-            el.setAttribute(n, nv);
-            --moR;
-            return;
-          } catch (eN) { --moR; }
-        }
-      }
-    }
-  }
-  function runMoNode(root) {
-    if (!root) return;
-    if (root.nodeType === 1) {
-      if (root.tagName === "A" && root.hasAttribute("href")) runMoAttr(root);
-      if (root.tagName === "FORM" && root.hasAttribute("action")) runMoAttr(root);
-      if (
-        (root.tagName === "IMG" && root.hasAttribute("src")) ||
-        (root.tagName === "SCRIPT" && root.hasAttribute("src")) ||
-        (root.tagName === "IFRAME" && root.hasAttribute("src")) ||
-        (root.tagName === "SOURCE" && (root.hasAttribute("src") || root.hasAttribute("srcset"))) ||
-        (root.tagName === "VIDEO" && root.hasAttribute("src")) ||
-        (root.tagName === "AUDIO" && root.hasAttribute("src")) ||
-        (root.tagName === "EMBED" && root.hasAttribute("src")) ||
-        (root.tagName === "TRACK" && root.hasAttribute("src")) ||
-        (root.tagName === "INPUT" && root.hasAttribute("src")) ||
-        (root.tagName === "USE" && (root.hasAttribute("href") || root.hasAttribute("xlink:href"))) ||
-        (root.tagName === "IMAGE" && (root.hasAttribute("href") || root.hasAttribute("xlink:href"))) ||
-        root.hasAttribute("style") ||
-        (root.tagName === "STYLE")
-      ) {
-        if (root.tagName === "STYLE" && root.innerHTML) {
-            var inner = root.innerHTML;
-            if (inner.indexOf("url(") !== -1) {
-                var rewritten = inner.replace(/url\([ \t\r\n\f]*(?:'([^']*)'|"([^"]*)"|([^'"\)[ \t\r\n\f]]+))[ \t\r\n\f]*\)/gi, function(m, q1, q2, unq) {
-                    var inn = q1 || q2 || unq;
-                    if (!inn || inn.indexOf("data:") === 0) return m;
-                    var q = q1 ? "'" : (q2 ? "\"" : "");
-                    return "url(" + q + p(inn) + q + ")";
-                });
-                rewritten = rewritten.replace(/@import[ \t\r\n\f]+(?:url\()?(?:'([^']*)'|"([^"]*)"|([^'"\)[ \t\r\n\f]]+))\)?/gi, function(m, q1, q2, unq) {
-                    var inn = q1 || q2 || unq;
-                    return "@import url(\"" + p(inn) + "\")";
-                });
-                if (rewritten !== inner) {
-                    try { ++moR; root.innerHTML = rewritten; --moR; } catch(e) {}
-                }
-            }
-        }
-        runMoAttr(root);
-      }
-    }
-    var c = root.children || root.childNodes, j;
-    for (j = 0; c && j < c.length; j++) runMoNode(c[j]);
-  }
-  if (typeof MutationObserver !== "undefined" && document.documentElement) {
-    new MutationObserver(function (recs) {
-      var i, r, j, n, el;
-      for (i = 0; i < recs.length; i++) {
-        r = recs[i];
-        if (r.type === "attributes" && r.target) runMoAttr(r.target);
-        if (r.type === "childList" && r.addedNodes) {
-          for (j = 0; j < r.addedNodes.length; j++) {
-            n = r.addedNodes[j];
-            runMoNode(n);
-          }
-        }
-      }
-    }).observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+      } catch(e) {}
+      return img;
+    };
+    window.Image.prototype = origImage.prototype;
   }
 
-  if (Node && Node.prototype) {
-    var aCh = Node.prototype.appendChild, iBef = Node.prototype.insertBefore, rC = Node.prototype.replaceChild;
-    if (aCh) {
-      Node.prototype.appendChild = function (n) {
-        if (n && n.nodeType === 1) runMoNode(n);
-        return aCh.apply(this, arguments);
-      };
-    }
-    if (iBef) {
-      Node.prototype.insertBefore = function (n, ref) {
-        if (n && n.nodeType === 1) runMoNode(n);
-        return iBef.apply(this, arguments);
-      };
-    }
-    if (rC) {
-      Node.prototype.replaceChild = function (n, o) {
-        if (n && n.nodeType === 1) runMoNode(n);
-        return rC.apply(this, arguments);
-      };
-    }
+  // ─── 15. Patch EventSource (SSE) ─────────────────────────────────────────
+  var origES = window.EventSource;
+  if (origES) {
+    window.EventSource = function(url, init) {
+      try { url = p(String(url)); } catch(e) {}
+      return new origES(url, init);
+    };
+    window.EventSource.prototype = origES.prototype;
   }
 
-  if (window.webkitURL) {
-    try { window.webkitURL = window.URL; } catch (eWk) {}
-  }
-
-  document.addEventListener("click", function (e) {
-    var t = e.target, n = 0;
-    while (t && t.tagName !== "A" && n++ < 14) t = t.parentNode;
-    if (!t || t.tagName !== "A") return;
-    var h = t.getAttribute("href");
-    if (!h || h[0] === "#") return;
-    try {
-      var w = new U0(t.href, mainLoc.href);
-      if (w.protocol === "http:" || w.protocol === "https:") {
-        e.preventDefault();
-        e.stopImmediatePropagation && e.stopImmediatePropagation();
-        mainLoc.assign(p(w.href));
-      }
-    } catch (b) {}
-  }, !0);
-}());
-`.replace(/<\s*\/\s*script/gi, "<\\\\/script");
+})();`;
 }

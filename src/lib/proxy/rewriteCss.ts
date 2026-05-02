@@ -1,52 +1,38 @@
-import { absUrl, skipRewrite, proxyParamUrl } from "./urls";
-
-function oneUrl(
-  m: string,
-  inner: string,
-  base: string,
-): string {
-  const t = inner.trim();
-  if (skipRewrite(t)) return m;
-  const abs = absUrl(t, base);
-  if (!abs) return m;
-  return `url(\"${esc(proxyParamUrl(abs, base))}\")`;
-}
-
-function esc(s: string): string {
-  return s.replace(/\\/g, "\\\\").replace(/\"/g, "\\\"");
-}
-
-/** `url()` only — for HTML style="" and inline <style> */
-export function rewriteUrlCallsInString(text: string, base: string): string {
-  let out = text;
-  out = out.replace(
-    /url\(\s*["']([^"']*)["']\s*\)/gi,
-    (m, inner) => oneUrl(m, inner, base),
-  );
-  out = out.replace(
-    /url\(\s*([^\)\"']+?)\s*\)/gi,
-    (m, inner) => {
-      const t = String(inner).trim();
-      if (t.includes("\"/proxy?url=") || t.includes("proxy?url=")) return m;
-      return oneUrl(m, t, base);
-    },
-  );
-  return out;
-}
+import { absUrl, proxyParamUrl, skipRewrite } from "./urls";
 
 /**
- * Full stylesheet: url(...) and @import.
+ * Rewrite url(...) and @import in CSS so assets load through the proxy.
+ * This handles stylesheets fetched via /proxy?url=... that reference
+ * relative or root-relative asset paths.
  */
 export function rewriteCss(css: string, base: string): string {
-  let out = rewriteUrlCallsInString(css, base);
-  out = out.replace(
-    /@import\s+([\"'])([^\"']+)\1/gi,
-    (match, _q, path: string) => {
-      if (skipRewrite(path)) return match;
-      const abs = absUrl(path, base);
-      if (!abs) return match;
-      return `@import \"${esc(proxyParamUrl(abs, base))}\"`;
-    },
+  // Rewrite url("...") / url('...') / url(...)
+  let out = css.replace(
+    /url\(\s*(['"]?)([^)'"]+?)\1\s*\)/gi,
+    (_match, quote, rawUrl) => {
+      const trimmed = rawUrl.trim();
+      if (!trimmed || skipRewrite(trimmed) || trimmed.startsWith("data:")) {
+        return _match;
+      }
+      const abs = absUrl(trimmed, base);
+      if (!abs) return _match;
+      const proxied = proxyParamUrl(abs, base);
+      return `url(${quote}${proxied}${quote})`;
+    }
   );
+
+  // Rewrite @import "..." / @import url(...)
+  out = out.replace(
+    /@import\s+(?:url\(\s*)?(['"]?)([^'"\s;)]+)\1(?:\s*\))?/gi,
+    (_match, _q, rawUrl) => {
+      const trimmed = rawUrl.trim();
+      if (!trimmed || skipRewrite(trimmed)) return _match;
+      const abs = absUrl(trimmed, base);
+      if (!abs) return _match;
+      const proxied = proxyParamUrl(abs, base);
+      return `@import url("${proxied}")`;
+    }
+  );
+
   return out;
 }

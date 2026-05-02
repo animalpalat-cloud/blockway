@@ -1,48 +1,46 @@
 import { doProxy } from "@/lib/proxy/doProxyRequest";
 import { type NextRequest, NextResponse } from "next/server";
 
-/** Puppeteer only runs in the Node.js runtime, not Edge. */
 export const runtime    = "nodejs";
 export const dynamic    = "force-dynamic";
 export const revalidate = 0;
 export const maxDuration = 120;
 
-function jsonError(message: string, status: number) {
-  const res = NextResponse.json({ error: message }, { status });
-  res.headers.set("Access-Control-Allow-Origin", "*");
-  res.headers.set("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
-  res.headers.set(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer",
-  );
-  res.headers.set("Access-Control-Max-Age", "86400");
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin":  "*",
+  "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS, PUT, PATCH, DELETE",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, " +
+    "User-Agent, Cookie, Range, X-Requested-With, Origin, Referer, " +
+    "X-Forwarded-For, DNT, Cache-Control, Pragma",
+  "Access-Control-Expose-Headers":
+    "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render",
+  "Access-Control-Max-Age": "86400",
+};
+
+function applyCors(res: NextResponse): NextResponse {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.headers.set(k, v);
   return res;
+}
+
+function jsonError(message: string, status: number) {
+  return applyCors(NextResponse.json({ error: message }, { status }));
 }
 
 export async function GET(request: NextRequest) {
   const url = request.nextUrl.searchParams.get("url") ?? "";
-  if (!url.trim()) {
-    return jsonError("Missing url query parameter.", 400);
-  }
+  if (!url.trim()) return jsonError("Missing url query parameter.", 400);
   return doProxy(request, url, "GET");
 }
 
 export async function POST(request: NextRequest) {
   const qpUrl = request.nextUrl.searchParams.get("url")?.trim() ?? "";
-  if (qpUrl) {
-    return doProxy(request, qpUrl, "POST");
-  }
-  let rawBody: Buffer | undefined;
+  if (qpUrl) return doProxy(request, qpUrl, "POST");
   try {
-    const arrayBuffer = await request.arrayBuffer();
-    rawBody = Buffer.from(arrayBuffer);
-    const bodyText = rawBody.toString("utf-8");
-    const body = JSON.parse(bodyText) as { url?: string };
+    const body = (await request.json()) as { url?: string };
     const target = body?.url?.trim() ?? "";
-    if (!target) {
-      return jsonError("Missing url in JSON body.", 400);
-    }
-    return doProxy(request, target, "POST", rawBody);
+    if (!target) return jsonError("Missing url in JSON body.", 400);
+    return doProxy(request, target, "POST");
   } catch {
     return jsonError("Missing url query parameter or valid JSON body.", 400);
   }
@@ -51,17 +49,27 @@ export async function POST(request: NextRequest) {
 export async function HEAD(request: NextRequest) {
   const url = request.nextUrl.searchParams.get("url") ?? "";
   if (!url.trim()) {
-    const res = new NextResponse(null, { status: 400 });
-    res.headers.set("Access-Control-Allow-Origin", "*");
-    res.headers.set("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
-    res.headers.set(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer",
-    );
-    res.headers.set("Access-Control-Max-Age", "86400");
-    return res;
+    return applyCors(new NextResponse(null, { status: 400 }));
   }
   return doProxy(request, url, "HEAD");
+}
+
+export async function PUT(request: NextRequest) {
+  const url = request.nextUrl.searchParams.get("url") ?? "";
+  if (!url.trim()) return jsonError("Missing url query parameter.", 400);
+  return doProxy(request, url, "PUT");
+}
+
+export async function PATCH(request: NextRequest) {
+  const url = request.nextUrl.searchParams.get("url") ?? "";
+  if (!url.trim()) return jsonError("Missing url query parameter.", 400);
+  return doProxy(request, url, "PATCH");
+}
+
+export async function DELETE(request: NextRequest) {
+  const url = request.nextUrl.searchParams.get("url") ?? "";
+  if (!url.trim()) return jsonError("Missing url query parameter.", 400);
+  return doProxy(request, url, "DELETE");
 }
 
 export async function OPTIONS(request: NextRequest) {
@@ -69,11 +77,9 @@ export async function OPTIONS(request: NextRequest) {
   return new NextResponse(null, {
     status: 204,
     headers: {
-      "Access-Control-Allow-Origin":  "*",
-      "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-      "Access-Control-Allow-Headers": reqHeaders
-        || "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, User-Agent, Cookie, Range, X-Requested-With, Origin, Referer",
-      "Access-Control-Max-Age":       "86400",
+      ...CORS_HEADERS,
+      "Access-Control-Allow-Headers":
+        reqHeaders || CORS_HEADERS["Access-Control-Allow-Headers"],
     },
   });
 }
