@@ -30,10 +30,25 @@ export const SESSION_COOKIE = "__ph_jar";
  *                  →  /proxy?url=https%3A%2F%2Fcdn.example.com%2Fimg.png&ref=...
  */
 export function proxyParamUrl(absolute: string, documentPageUrl?: string): string {
-  if (isSubdomainModeEnabled()) {
+  // KEY DECISION: which proxy mode to use for this asset?
+  //
+  // If the document page URL is a query-param proxy URL (/proxy?url=...)
+  // then ALL assets on that page MUST also use query-param mode.
+  // Reason: the page origin is daddyproxy.com, and subdomain assets come
+  // from *.daddyproxy.com — a DIFFERENT origin. The browser blocks these
+  // cross-origin CSS/JS loads with CORS errors.
+  //
+  // If the document page URL is a subdomain proxy URL (e.g. xhaccess--com.daddyproxy.com)
+  // then subdomain mode is safe — all assets are same-origin with the page.
+  const docIsQueryParam = documentPageUrl
+    ? documentPageUrl.includes("/proxy?url=") || documentPageUrl.includes("/proxy%3Furl")
+    : false;
+
+  if (isSubdomainModeEnabled() && !docIsQueryParam) {
     return _subdomainRewrite(absolute, documentPageUrl);
   }
-  // Legacy query-param fallback
+
+  // Query-param mode (either forced by doc context, or subdomain mode disabled)
   let u = `${PROXY_PATH}?url=${encodeURIComponent(absolute)}`;
   if (documentPageUrl) {
     const t = documentPageUrl.trim();
