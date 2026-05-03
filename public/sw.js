@@ -2,180 +2,165 @@
 "use strict";
 
 /**
- * Proxy Service Worker — intercepts "leaked" same-origin asset requests
- * and reroutes them through /proxy?url=...
+ * Proxy Service Worker — Updated for subdomain mode
  *
- * How assets leak:
- *   The proxied page loads at /proxy?url=https://example.com
- *   A script does: fetch('/api/data') — resolved to https://yoursite.com/api/data
- *   But the SW knows the page's "real" origin is https://example.com
- *   So it rewrites to /proxy?url=https://example.com/api/data
+ * In SUBDOMAIN MODE (PROXY_ROOT_DOMAIN set):
+ *   Pages load on: xhopen--com.daddyproxy.com
+ *   Assets from xhopen.com CDNs go to: static--xhpingcdn--com.daddyproxy.com
+ *   The SW's job is minimal — subdomain routing handles most assets.
+ *   We mainly intercept relative-path requests that bypass subdomain rewriting.
  *
- * What we DON'T intercept (bypass list):
- *   - /_next/* (Next.js framework assets)
- *   - /proxy?url=* (already proxied)
- *   - /api/* (proxy API endpoints)
- *   - /sw.js, /pwa.js (this file itself)
+ * In QUERY-PARAM MODE:
+ *   Pages load on: daddyproxy.com/proxy?url=https://xhopen.com
+ *   The SW intercepts leaked asset requests (relative paths) and rerouts them.
  */
 
-const PROXY_PATH = "/proxy";
-const BYPASS_PREFIXES = [
-  "/_next/",
-  "/api/",
-  "/__next",
-];
-const BYPASS_EXACT = new Set(["/sw.js", "/pwa.js", "/manifest.json", "/favicon.ico"]);
-
-const ASSET_EXT_RE =
-  /\.(?:avif|bmp|css|eot|gif|ico|jpeg|jpg|js|json|m3u8|m4a|m4s|mp3|mp4|ogg|otf|png|svg|ttf|txt|wasm|webm|webp|woff2?|xml)(?:$|\?)/i;
-
-const SW_VERSION = "v4";
+const SW_VERSION = "v5-subdomain";
 const CACHE_NAME = `proxy-sw-${SW_VERSION}`;
 
-// ─── Install & Activate ───────────────────────────────────────────────────────
-self.addEventListener("install", (event) => {
-  // Skip waiting so the new SW activates immediately
-  self.skipWaiting();
-});
+const BYPASS_PREFIXES = ["/_next/", "/api/", "/__next"];
+const BYPASS_EXACT    = new Set(["/sw.js", "/pwa.js", "/manifest.json", "/favicon.ico"]);
+const ASSET_EXT_RE    =
+  /\.(?:avif|bmp|css|eot|gif|ico|jpeg|jpg|js|json|m3u8|m4a|m4s|mp3|mp4|ogg|otf|png|svg|ttf|txt|wasm|webm|webp|woff2?|xml)(?:[?#]|$)/i;
 
-self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    Promise.all([
-      // Claim all clients so the SW takes effect immediately
-      self.clients.claim(),
-      // Clean up old cache versions
-      caches.keys().then((keys) =>
-        Promise.all(
-          keys
-            .filter((k) => k.startsWith("proxy-sw-") && k !== CACHE_NAME)
-            .map((k) => caches.delete(k))
-        )
-      ),
-    ])
-  );
+self.addEventListener("install",  () => self.skipWaiting());
+self.addEventListener("activate", (e) => {
+  e.waitUntil(Promise.all([
+    self.clients.claim(),
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k.startsWith("proxy-sw-") && k !== CACHE_NAME).map((k) => caches.delete(k)))
+    ),
+  ]));
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function isProxyRequest(url) {
-  return (
-    url.pathname === PROXY_PATH ||
-    url.pathname.startsWith(PROXY_PATH + "/")
-  );
-}
 
 function isBypass(url) {
   if (url.origin !== self.location.origin) return true;
-  if (BYPASS_EXACT.has(url.pathname)) return true;
-  for (const prefix of BYPASS_PREFIXES) {
-    if (url.pathname.startsWith(prefix)) return true;
-  }
-  return false;
+  if (BYPASS_EXACT.has(url.pathname))      return true;
+  return BYPASS_PREFIXES.some((p) => url.pathname.startsWith(p));
 }
 
 /**
- * Given a client's URL (e.g. /proxy?url=https://example.com/page),
- * extract the proxied target URL.
+ * Detect if this SW is running in subdomain mode by checking its own location.
+ * In subdomain mode the SW is registered from xhopen--com.daddyproxy.com
+ * or from daddyproxy.com — but in all cases self.location.hostname tells us.
  */
-function fromProxyTarget(clientUrl) {
+function getRootDomainFromSelf() {
+  // self.location.hostname is e.g. "xhopen--com.daddyproxy.com" or "daddyproxy.com"
+  // We need to recover the root domain.
+  // Strategy: look for the longest suffix that doesn't contain "--"
+  const h = self.location.hostname;
+  const parts = h.split(".");
+  // Walk from the right, collecting until we find a label with "--"
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i].includes("--")) {
+      // Everything to the right of here is the root domain
+      return parts.slice(i + 1).join(".");
+    }
+  }
+  return h; // must be the root domain itself
+}
+
+function isSubdomainRequest(url) {
+  const root = getRootDomainFromSelf();
+  if (!root || root === url.hostname) return false;
+  return url.hostname.endsWith("." + root);
+}
+
+function decodeSubdomainToHost(prefix) {
+  return prefix.replace(/--/g, ".");
+}
+
+/** Extract the proxied target origin from a client URL */
+function getClientTargetOrigin(clientUrl) {
   try {
     const u = new URL(clientUrl);
-    const raw = u.searchParams.get("url");
-    if (!raw) return null;
-    return new URL(decodeURIComponent(raw));
-  } catch {
-    return null;
-  }
-}
 
-/**
- * An asset request that arrived at the proxy origin without /proxy?url=...
- * path. This means the JS on the page made a relative request that resolved
- * to the proxy server instead of the target server.
- */
-function shouldReroute(url) {
-  if (url.origin !== self.location.origin) return false;
-  if (isProxyRequest(url)) return false;
-  if (isBypass(url)) return false;
-  // Reroute if it's a known asset extension or has a query string
-  return ASSET_EXT_RE.test(url.pathname) || url.search.length > 1;
+    // Subdomain mode: xhopen--com.daddyproxy.com → https://xhopen.com
+    if (isSubdomainRequest(u)) {
+      const root = getRootDomainFromSelf();
+      const prefix = u.hostname.slice(0, u.hostname.length - root.length - 1);
+      const host = decodeSubdomainToHost(prefix);
+      return { host, origin: `${u.protocol}//${host}`, proto: u.protocol };
+    }
+
+    // Query-param mode: daddyproxy.com/proxy?url=https://xhopen.com/
+    const sp = u.searchParams;
+    const raw = sp.get("url");
+    if (raw) {
+      const target = new URL(decodeURIComponent(raw));
+      return { host: target.hostname, origin: target.origin, proto: target.protocol };
+    }
+  } catch {}
+  return null;
 }
 
 // ─── Fetch handler ────────────────────────────────────────────────────────────
+
 self.addEventListener("fetch", (event) => {
-  const req = event.request;
+  if (event.request.method !== "GET") return;
+  const reqUrl = new URL(event.request.url);
+  if (isBypass(reqUrl)) return;
 
-  // Only handle GET requests — POST/etc. are API calls, not asset loads
-  if (req.method !== "GET") return;
+  // In subdomain mode: if this is a direct CDN request (no --encoding in host),
+  // it means it leaked from JS without our patch catching it. Reroute it.
+  // If it IS a subdomain request, pass through — the server handles it.
+  if (isSubdomainRequest(reqUrl)) return; // already routed correctly
 
-  const reqUrl = new URL(req.url);
+  // Only intercept same-origin requests (leaked relative-path assets)
+  if (reqUrl.origin !== self.location.origin) return;
 
-  // Fast exit for requests we should not intercept
-  if (!shouldReroute(reqUrl)) return;
+  // Only intercept asset-like paths
+  if (!ASSET_EXT_RE.test(reqUrl.pathname) && !reqUrl.search) return;
 
-  event.respondWith(handleFetch(event, req, reqUrl));
+  event.respondWith(handleFetch(event, reqUrl));
 });
 
-async function handleFetch(event, req, reqUrl) {
-  // Find the client (page) that made this request to determine its proxy context
-  let currentTarget = null;
+async function handleFetch(event, reqUrl) {
+  let clientTarget = null;
 
   if (event.clientId) {
     const client = await self.clients.get(event.clientId);
-    if (client) currentTarget = fromProxyTarget(client.url);
+    if (client) clientTarget = getClientTargetOrigin(client.url);
   }
-
-  // Also check resultingClientId (for navigation requests)
-  if (!currentTarget && event.resultingClientId) {
+  if (!clientTarget && event.resultingClientId) {
     const client = await self.clients.get(event.resultingClientId);
-    if (client) currentTarget = fromProxyTarget(client.url);
+    if (client) clientTarget = getClientTargetOrigin(client.url);
   }
 
-  if (!currentTarget) {
-    // No proxy context — pass through normally
-    return fetch(req);
+  if (!clientTarget) return fetch(event.request);
+
+  const root = getRootDomainFromSelf();
+
+  let proxyUrl;
+  if (root) {
+    // Subdomain mode: rewrite to subdomain URL
+    const { host, proto } = clientTarget;
+    const encodedHost = host.replace(/\./g, "--");
+    const p = proto.replace(/:$/, "");
+    proxyUrl = `${p}://${encodedHost}.${root}${reqUrl.pathname}${reqUrl.search}`;
+  } else {
+    // Query-param mode: rewrite to /proxy?url=...
+    const targetAssetUrl = `${clientTarget.origin}${reqUrl.pathname}${reqUrl.search}`;
+    proxyUrl = `/proxy?url=${encodeURIComponent(targetAssetUrl)}&ref=${encodeURIComponent(clientTarget.origin)}`;
   }
-
-  // Build the real target URL: resolve the relative path against the proxied origin
-  const targetAssetUrl = new URL(
-    reqUrl.pathname + reqUrl.search,
-    currentTarget.origin + "/"
-  );
-
-  // Build the proxied URL
-  const proxied = new URL(PROXY_PATH, self.location.origin);
-  proxied.searchParams.set("url", targetAssetUrl.toString());
-  proxied.searchParams.set("ref", currentTarget.toString());
-
-  // Build clean request headers (strip SW/Next.js internal headers)
-  const headers = new Headers(req.headers);
-  headers.delete("x-middleware-subrequest");
-  headers.delete("x-nextjs-data");
-  headers.delete("x-next-router-prefetch");
 
   try {
-    return await fetch(
-      new Request(proxied.toString(), {
-        method:      "GET",
-        headers,
-        mode:        "same-origin",
-        credentials: "include",
-        redirect:    "follow",
-        cache:       "no-store",
-      })
-    );
-  } catch (err) {
-    // On failure, fall back to original request
-    console.warn("[proxy-sw] Failed to proxy asset, falling back:", reqUrl.pathname, err);
-    return fetch(req);
+    return await fetch(new Request(proxyUrl, {
+      method:      "GET",
+      headers:     event.request.headers,
+      mode:        "same-origin",
+      credentials: "include",
+      redirect:    "follow",
+      cache:       "no-store",
+    }));
+  } catch {
+    return fetch(event.request);
   }
 }
 
-// ─── Message handler (for manual cache clearing) ──────────────────────────────
 self.addEventListener("message", (event) => {
-  if (event.data && event.data.type === "SKIP_WAITING") {
-    self.skipWaiting();
-  }
-  if (event.data && event.data.type === "CLEAR_CACHE") {
-    caches.delete(CACHE_NAME);
-  }
+  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+  if (event.data?.type === "CLEAR_CACHE")  caches.delete(CACHE_NAME);
 });
