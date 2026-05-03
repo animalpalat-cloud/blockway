@@ -151,6 +151,18 @@ export function buildClientRuntimePatch(
       if (_proxyHost && xh === _proxyHost && isInternalPath(x)) return x.href;
       if (_subdomainMode && xh === _rootDomain && isInternalPath(x)) return x.href;
 
+      // FIX: if URL resolved to our proxy domain (e.g. collector.daddyproxy.com)
+      // but is NOT a known proxy path, the site built a URL using our hostname by mistake.
+      // Redirect it to the target origin instead.
+      if (_rootDomain && xh.endsWith("." + _rootDomain) && !isAlreadyProxied(x.href)) {
+        // Rewrite: keep path+query but use target origin
+        var _corrected = _targetOrigin + x.pathname + x.search + x.hash;
+        try {
+          var _cx = new _origURL(_corrected);
+          return toProxyUrl(_cx.href);
+        } catch(e) {}
+      }
+
       // Already proxied after full URL resolution
       if (isAlreadyProxied(x.href)) return x.href;
 

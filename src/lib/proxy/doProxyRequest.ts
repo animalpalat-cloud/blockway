@@ -16,9 +16,17 @@ import { MAX_SIZE_MB, PROXY_TIMEOUT_MS, shouldRenderHtmlWithPuppeteer } from "./
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 const CORS_ALLOW_METHODS = "GET, POST, HEAD, PUT, PATCH, DELETE";
 const CORS_ALLOW_HEADERS =
+  // Standard headers
   "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, " +
   "User-Agent, Cookie, Range, X-Requested-With, Origin, Referer, " +
-  "X-Forwarded-For, DNT, Cache-Control, Pragma";
+  "X-Forwarded-For, DNT, Cache-Control, Pragma, " +
+  // Custom headers that target sites send in preflights (x-request-id, x-client-info, etc.)
+  // We must allow ALL of these or the OPTIONS preflight returns 403 and the real request fails.
+  "X-Request-ID, X-Request-Id, X-Client-ID, X-Client-Info, X-Api-Key, X-Api-Version, " +
+  "X-Trace-ID, X-Correlation-ID, X-Session-ID, X-User-Agent, X-Device-ID, " +
+  "X-Platform, X-App-Version, X-Build-Version, X-Access-Token, X-Auth-Token, " +
+  "X-CSRF-Token, X-Csrf-Token, X-Custom-Header, X-Forwarded-Host, " +
+  "If-Modified-Since, If-None-Match, If-Range, If-Unmodified-Since";
 const CORS_EXPOSE_HEADERS =
   "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render";
 
@@ -52,12 +60,19 @@ function isStreamingContentType(ct: string): boolean {
   return STREAMING_CONTENT_TYPES.some((t) => c.includes(t));
 }
 
-function applyCorsHeaders(headers: Headers): void {
-  headers.set("access-control-allow-origin", "*");
+function applyCorsHeaders(headers: Headers, requestOrigin?: string): void {
+  // Use specific origin when available — required for requests with credentials (withCredentials=true)
+  // Using "*" with credentials causes: "wildcard not allowed when credentials mode is include"
+  const origin = requestOrigin || "*";
+  headers.set("access-control-allow-origin", origin);
+  if (origin !== "*") {
+    headers.set("access-control-allow-credentials", "true");
+  }
   headers.set("access-control-allow-methods", CORS_ALLOW_METHODS);
   headers.set("access-control-allow-headers", CORS_ALLOW_HEADERS);
   headers.set("access-control-max-age", "86400");
   headers.set("access-control-expose-headers", CORS_EXPOSE_HEADERS);
+  headers.set("vary", "Origin");
 }
 
 function getSessionId(request: NextRequest): string {
@@ -85,9 +100,9 @@ function attachSessionCookie(res: NextResponse, sessionId: string): void {
   res.cookies.set(SESSION_COOKIE, sessionId, cookieOptions);
 }
 
-function errorJson(message: string, status: number, sessionId: string): NextResponse {
+function errorJson(message: string, status: number, sessionId: string, origin?: string): NextResponse {
   const res = NextResponse.json({ error: message }, { status });
-  applyCorsHeaders(res.headers);
+  applyCorsHeaders(res.headers, origin);
   attachSessionCookie(res, sessionId);
   return res;
 }
@@ -113,7 +128,8 @@ function buildStreamingResponse(
     }
   });
 
-  applyCorsHeaders(resHeaders);
+  const reqOrigin = request.headers.get("origin") ?? undefined;
+  applyCorsHeaders(resHeaders, reqOrigin);
   resHeaders.set("x-proxy-final-url", finalUrl);
   resHeaders.set("x-proxy-render", "stream");
   resHeaders.delete("content-security-policy");
@@ -137,7 +153,8 @@ function buildPuppeteerProxyResponse(
   resHeaders.set("x-proxy-render", "puppeteer");
   resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
   resHeaders.set("pragma", "no-cache");
-  applyCorsHeaders(resHeaders);
+  const reqOrigin = request.headers.get("origin") ?? undefined;
+  applyCorsHeaders(resHeaders, reqOrigin);
   resHeaders.set("x-proxy-final-url", finalUrl);
   resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
   const res = new NextResponse(new Uint8Array(body), { status, headers: resHeaders });
@@ -291,7 +308,8 @@ export async function doProxy(
   resHeaders.delete("age");
   resHeaders.delete("expires");
 
-  applyCorsHeaders(resHeaders);
+  const reqOrigin = request.headers.get("origin") ?? undefined;
+  applyCorsHeaders(resHeaders, reqOrigin);
   resHeaders.set("x-proxy-final-url", finalUrl);
   resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
 
