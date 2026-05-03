@@ -2,6 +2,7 @@ import * as cheerio from "cheerio";
 import type { CheerioAPI } from "cheerio";
 import { buildClientRuntimePatch } from "./clientRuntime";
 import { absUrl, isLikelyUrl, proxyParamUrl, skipRewrite } from "./urls";
+import { getRootDomain, encodeHostToSubdomain, isSubdomainModeEnabled } from "./subdomainRouter";
 
 const URL_ATTRS: { sel: string; attr: string }[] = [
   { sel: "a[href]",              attr: "href" },
@@ -29,25 +30,22 @@ const URL_ATTRS: { sel: string; attr: string }[] = [
   { sel: "meta[content][http-equiv='refresh']", attr: "content" },
 ];
 
-/** Scripts from these domains are analytics/ads — safe to strip. */
+/**
+ * Tracking/analytics scripts — we still strip these to reduce noise,
+ * but we keep all CDN/media/asset scripts.
+ */
 const TRACKING_PATTERNS = [
-  "cloudflareinsights.com",
-  "google-analytics.com",
-  "googletagmanager.com",
+  "google-analytics.com/analytics",
+  "googletagmanager.com/gtag",
   "doubleclick.net",
-  "redditstatic.com/ads",
-  "reddit.com/tracking",
-  "/analytics",
-  "/track",
-  "/pixel",
   "hotjar.com",
-  "segment.com",
-  "mixpanel.com",
   "fullstory.com",
   "heap.io",
+  "mixpanel.com/lib",
+  "segment.com/analytics",
 ];
 
-function isTrackingOrThirdPartyScript(url: string): boolean {
+function isTrackingScript(url: string): boolean {
   const s = url.toLowerCase();
   return TRACKING_PATTERNS.some((p) => s.includes(p));
 }
@@ -56,13 +54,19 @@ function rewriteAttributeValue(val: string, base: string): string | null {
   const trimmed = (val ?? "").trim();
   if (!trimmed) return null;
   if (trimmed.startsWith("data:")) return trimmed;
-  if (skipRewrite(trimmed) || trimmed.includes("proxy?url=")) return null;
-  if (isTrackingOrThirdPartyScript(trimmed)) return null;
+  if (skipRewrite(trimmed)) return null;
+  // Already proxied in either mode
+  if (trimmed.includes("/proxy?url=")) return null;
+  if (isSubdomainModeEnabled()) {
+    const root = getRootDomain();
+    if (trimmed.includes(`.${root}`)) return null; // already subdomain-proxied
+  }
+  if (isTrackingScript(trimmed)) return null;
   if (!isLikelyUrl(val)) return null;
   const abs = absUrl(trimmed, base);
   if (!abs) return null;
-  if (isTrackingOrThirdPartyScript(abs)) return null;
-  return proxyParamUrl(abs, base);
+  if (isTrackingScript(abs)) return null;
+  return proxyParamUrl(abs, base); // proxyParamUrl is now subdomain-aware
 }
 
 function rewriteSrcsetValue(srcset: string, base: string): string {
@@ -87,28 +91,24 @@ function rewriteSrcsetValue(srcset: string, base: string): string {
       const bits = token.split(/\s+/);
       const url = bits[0] ?? "";
       const rewritten = rewriteAttributeValue(url, base) ?? url;
-      if (bits.length <= 1) return rewritten;
-      return `${rewritten} ${bits.slice(1).join(" ")}`;
+      return bits.length <= 1 ? rewritten : `${rewritten} ${bits.slice(1).join(" ")}`;
     })
     .join(", ");
 }
 
 function rewriteMetaRefresh(content: string, base: string): string {
-  // Format: "0; url=https://example.com/page"
   const m = content.match(/^(\d+(?:\.\d+)?\s*;?\s*url=)(.+)$/i);
   if (!m) return content;
   const rewritten = rewriteAttributeValue(m[2].trim(), base);
   return rewritten ? `${m[1]}${rewritten}` : content;
 }
 
-/** Core rewrites: URL attrs, CSP removal, meta cleanup */
 function applyCoreRewrites($: CheerioAPI, base: string): void {
-  // Remove all CSP metas — they would block our injected scripts
+  // Strip CSP — it would block our injected scripts
   $("meta").each((_, el) => {
     const he = String($(el).attr("http-equiv") ?? "").trim().toLowerCase();
     if (he === "content-security-policy" || he === "content-security-policy-report-only") {
-      $(el).remove();
-      return;
+      $(el).remove(); return;
     }
     const nm = String($(el).attr("name") ?? "").trim().toLowerCase();
     if (nm === "referrer" || nm === "content-security-policy" || nm === "csp") {
@@ -116,25 +116,21 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
     }
   });
 
-  // Remove preconnect/DNS-prefetch — these would leak the target origin in headers
-  $(
-    'link[rel="preconnect"], link[rel=preconnect], ' +
-    'link[rel="dns-prefetch"], link[rel=dns-prefetch], ' +
-    'link[rel="prerender"]',
-  ).remove();
+  // Remove preconnect/DNS-prefetch — these would leak target hostname to CDNs
+  $('link[rel="preconnect"], link[rel=preconnect], link[rel="dns-prefetch"], link[rel=dns-prefetch], link[rel="prerender"]').remove();
 
-  // Remove service worker registrations — would intercept our proxy SW
-  $('link[rel="manifest"], link[rel=manifest], link[rel="serviceworker"], link[rel=serviceworker]').remove();
+  // Remove SW manifests — they'd intercept our proxy SW
+  $('link[rel="manifest"], link[rel=manifest]').remove();
 
-  // Remove integrity attributes — our rewrites invalidate SRI hashes
+  // Remove SRI hashes — rewriting changes content so hashes would fail
   $("[integrity]").removeAttr("integrity");
 
-  // Remove crossorigin="use-credentials" — changes CORS mode unexpectedly
+  // Remove use-credentials crossorigin — changes CORS mode
   $("[crossorigin]").each((_, el) => {
-    const co = $(el).attr("crossorigin") ?? "";
-    if (co === "use-credentials") $(el).removeAttr("crossorigin");
+    if ($(el).attr("crossorigin") === "use-credentials") $(el).removeAttr("crossorigin");
   });
 
+  // Rewrite all URL attributes
   for (const { sel, attr } of URL_ATTRS) {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
@@ -158,7 +154,6 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
         if (!isCss) return;
       }
 
-      // Don't block auth links — let JS handle navigation via proxy
       const next = rewriteAttributeValue(v, base);
       if (next && next !== v) $(el).attr(attr, next);
     });
@@ -172,13 +167,10 @@ function applyCoreRewrites($: CheerioAPI, base: string): void {
   });
 }
 
-/** Rewrite url(...) in inline style attributes */
 function rewriteInlineStyleUrls(style: string, base: string): string {
   return style.replace(/url\(\s*(['"]?)([^)'"]+)\1\s*\)/gi, (_match, quote, url) => {
     const trimmed = url.trim();
-    if (!trimmed || trimmed.startsWith("data:") || skipRewrite(trimmed)) {
-      return _match;
-    }
+    if (!trimmed || trimmed.startsWith("data:") || skipRewrite(trimmed)) return _match;
     const abs = absUrl(trimmed, base);
     if (!abs) return _match;
     const proxied = proxyParamUrl(abs, base);
@@ -200,6 +192,13 @@ function rewriteInertFragment(html: string, base: string): string {
   return $.html();
 }
 
+/**
+ * Main HTML rewriter.
+ *
+ * @param html               Raw HTML from upstream
+ * @param base               The final URL of this document (after redirects)
+ * @param injectClientRuntime Whether to inject our JS patch
+ */
 export function rewriteHtml(
   html: string,
   base: string,
@@ -212,27 +211,36 @@ export function rewriteHtml(
   const headInject: string[] = [];
 
   if (injectClientRuntime) {
-    const origin = new URL(base).origin;
+    let targetOrigin = "";
+    try { targetOrigin = new URL(base).origin; } catch { targetOrigin = base; }
 
-    // Service worker registration — intercepts leaked same-origin asset requests
+    // Build opts for subdomain mode
+    const opts: { rootDomain?: string; subdomainPrefix?: string } = {};
+    if (isSubdomainModeEnabled()) {
+      opts.rootDomain = getRootDomain();
+      try {
+        const u = new URL(base);
+        opts.subdomainPrefix = encodeHostToSubdomain(u.hostname);
+      } catch { /* ignore */ }
+    }
+
+    // SW registration
     headInject.push(
       "<script>(function(){" +
       "if(!('serviceWorker' in navigator))return;" +
-      "function reg(p){return navigator.serviceWorker.register(p,{scope:'/'})};" +
-      "reg('/sw.js').catch(function(){return reg('/pwa.js')}).catch(function(){});" +
+      "navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});" +
       "})();</script>",
     );
 
-    // Main client-side URL/fetch patch
-    headInject.push(`<script>${buildClientRuntimePatch(origin)}</script>`);
+    // Main runtime patch
+    headInject.push(`<script>${buildClientRuntimePatch(targetOrigin, opts)}</script>`);
   }
 
-  // Suppress referrer leaks from the proxied page
+  // Always suppress referrer leaks
   headInject.push('<meta name="referrer" content="no-referrer">');
 
-  // Viewport meta — ensures mobile sites render correctly through proxy
-  const hasViewport = $('meta[name="viewport"]').length > 0;
-  if (!hasViewport) {
+  // Viewport
+  if (!$('meta[name="viewport"]').length) {
     headInject.push('<meta name="viewport" content="width=device-width, initial-scale=1">');
   }
 

@@ -2,8 +2,11 @@ import { absUrl, proxyParamUrl, skipRewrite } from "./urls";
 
 /**
  * Rewrite url(...) and @import in CSS so assets load through the proxy.
- * This handles stylesheets fetched via /proxy?url=... that reference
- * relative or root-relative asset paths.
+ *
+ * In subdomain mode, CSS assets from CDNs like static.xhpingcdn.com are
+ * rewritten to static--xhpingcdn--com.daddyproxy.com/...
+ * so the browser's requests look like they originate from that domain —
+ * bypassing CDN hotlink protection.
  */
 export function rewriteCss(css: string, base: string): string {
   // Rewrite url("...") / url('...') / url(...)
@@ -16,7 +19,7 @@ export function rewriteCss(css: string, base: string): string {
       }
       const abs = absUrl(trimmed, base);
       if (!abs) return _match;
-      const proxied = proxyParamUrl(abs, base);
+      const proxied = proxyParamUrl(abs, base); // subdomain-aware
       return `url(${quote}${proxied}${quote})`;
     }
   );
@@ -29,7 +32,7 @@ export function rewriteCss(css: string, base: string): string {
       if (!trimmed || skipRewrite(trimmed)) return _match;
       const abs = absUrl(trimmed, base);
       if (!abs) return _match;
-      const proxied = proxyParamUrl(abs, base);
+      const proxied = proxyParamUrl(abs, base); // subdomain-aware
       return `@import url("${proxied}")`;
     }
   );

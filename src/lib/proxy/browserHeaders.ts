@@ -188,11 +188,35 @@ export function pickAcceptLanguage(): string {
 // Modern browsers support Brotli; add zstd for Chrome 118+
 export const DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br, zstd";
 
+/**
+ * Validate and extract the real target referer from the `ref` query param.
+ *
+ * The `ref` param is the URL of the proxied page that initiated this request.
+ * It may be:
+ *   A) The real target URL: https://xhopen.com/
+ *   B) The proxy URL wrapping it: https://daddyproxy.com/proxy?url=https%3A%2F%2Fxhopen.com%2F
+ *
+ * Case B happens when clientRuntime sends currentRef() which includes the full
+ * proxy URL in the address bar. We must unwrap it to case A, otherwise the
+ * target server sees "daddyproxy.com" as the referer and returns 403.
+ */
 export function safeDocumentRefererParam(raw: string | null | undefined): string | null {
   if (raw == null) return null;
   const p = String(raw).trim();
   if (!p || p.length > 8_192) return null;
-  const u = normalizeUrl(p);
+
+  // Unwrap proxy URL: /proxy?url=https%3A%2F%2Fxhopen.com%2F → https://xhopen.com/
+  let candidate = p;
+  const proxyMatch = p.match(/[?&]url=([^&]+)/);
+  if (proxyMatch?.[1]) {
+    try {
+      candidate = decodeURIComponent(proxyMatch[1]);
+    } catch {
+      candidate = p;
+    }
+  }
+
+  const u = normalizeUrl(candidate);
   if (!u || isBlockedTarget(u)) return null;
   if (u.protocol !== "http:" && u.protocol !== "https:") return null;
   return u.toString();
