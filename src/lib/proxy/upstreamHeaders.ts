@@ -174,6 +174,9 @@ export function headersToForwardForPuppeteer(h: Headers): Record<string, string>
 }
 
 export const STRIP_FROM_RESPONSE = new Set([
+  // Strip Alt-Svc to prevent browser from attempting QUIC/HTTP3 directly to origin
+  // This avoids ERR_QUIC_PROTOCOL_ERROR which happens when browser tries h3 without proxy
+  "alt-svc",
   // Security headers that break proxied content
   "content-security-policy",
   "content-security-policy-report-only",
