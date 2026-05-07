@@ -60,12 +60,45 @@ export function isSubdomainModeEnabled(): boolean {
  *   ic-vt-nss.xhpingcdn.com → ic-vt-nss--xhpingcdn--com
  *   www.google.com → www--google--com
  */
+// Hosts where we strip "www." to avoid 4-level subdomain DNS failures.
+// Cloudflare wildcard *.daddyproxy.com only covers ONE level deep.
+// www.youtube.com → www--youtube--com.daddyproxy.com would be 4 levels and fail DNS.
+// So we canonicalize: www.youtube.com → youtube.com → youtube--com.daddyproxy.com
+const WWW_STRIP_HOSTS = new Set([
+  "youtube.com",
+  "google.com",
+  "facebook.com",
+  "twitter.com",
+  "x.com",
+  "instagram.com",
+  "tiktok.com",
+  "reddit.com",
+  "netflix.com",
+  "twitch.tv",
+  "linkedin.com",
+  "pinterest.com",
+  "tumblr.com",
+  "wikipedia.org",
+  "github.com",
+  "amazon.com",
+  "ebay.com",
+  "dailymotion.com",
+  "vimeo.com",
+]);
+
 export function encodeHostToSubdomain(hostname: string): string {
-  // Dots → double dash, lowercase, strip trailing dots
-  return hostname
-    .toLowerCase()
-    .replace(/\.+$/, "")
-    .replace(/\./g, "--");
+  let h = hostname.toLowerCase().replace(/\.+$/, "");
+
+  // Strip www. prefix for known major sites to avoid multi-level subdomain DNS issues
+  // www.youtube.com → youtube.com → youtube--com (resolves correctly)
+  if (h.startsWith("www.")) {
+    const withoutWww = h.slice(4);
+    if (WWW_STRIP_HOSTS.has(withoutWww)) {
+      h = withoutWww;
+    }
+  }
+
+  return h.replace(/\./g, "--");
 }
 
 /**
