@@ -203,10 +203,19 @@ export function rewriteHtml(
   html: string,
   base: string,
   injectClientRuntime: boolean,
+  proxyPageUrl?: string,   // The proxy URL the browser used to request this page
+                           // e.g. "https://daddyproxy.com/proxy?url=https://youtube.com/"
+                           // Used to detect query-param mode and keep all assets consistent
 ): string {
+  // Determine rewrite context:
+  // If the page was loaded via query-param mode (/proxy?url=...), ALL assets must
+  // also use query-param mode to avoid cross-origin errors.
+  // Pass proxyPageUrl as the documentPageUrl hint to proxyParamUrl().
+  const rewriteBase = proxyPageUrl || base;
+
   const $ = cheerio.load(html, { xml: false });
-  applyCoreRewrites($, base);
-  rewriteInertSubfragments($, base);
+  applyCoreRewrites($, rewriteBase);
+  rewriteInertSubfragments($, rewriteBase);
 
   const headInject: string[] = [];
 

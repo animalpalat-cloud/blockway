@@ -175,7 +175,7 @@ export async function doProxy(
         parsed, request.headers, sessionId, jarHost, documentReferer,
       );
       absorbPuppeteerCookies(sessionId, r.cookies);
-      const out = Buffer.from(rewriteHtml(r.html, r.finalUrl, false), "utf-8");
+      const out = Buffer.from(rewriteHtml(r.html, r.finalUrl, false, request.url), "utf-8");
       if (out.length > maxBytes) return errorJson("Response too large.", 413, sessionId);
       return buildPuppeteerProxyResponse(out, {
         status: r.status, sessionId, jarHost, finalUrl: r.finalUrl, requestOrigin,
@@ -253,7 +253,7 @@ export async function doProxy(
 
   let responseBody: Buffer = buf;
   if (hasBody && sniffHtml) {
-    responseBody = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true), "utf-8");
+    responseBody = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true, request.url), "utf-8");
   } else if (hasBody && isCss) {
     responseBody = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
   }
