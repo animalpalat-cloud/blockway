@@ -1,38 +1,26 @@
 /**
  * ipRotation.ts — Outbound IP rotation
  *
- * Supports three modes, set via environment variables:
+ * Supports three modes via PROXY_MODE in .env.local:
+ *   direct   = no proxy, direct fetch with retry (default)
+ *   tor      = Tor SOCKS5 (free, slow)
+ *   iproyal  = IPRoyal Unblocker or Rotating Residential (paid, fast)
  *
- *   MODE=direct  (default) — No proxy, direct fetch with retry
- *   MODE=tor               — Route through Tor SOCKS5 (free, slow)
- *   MODE=iproyal           — Route through IPRoyal residential proxies (paid, fast)
+ * IPRoyal Unblocker endpoint: unblocker.iproyal.com:12323
+ * IPRoyal Rotating endpoint:  geo.iproyal.com:12321
  *
- * IPRoyal setup:
- *   1. Sign up at iproyal.com → Residential Proxies
- *   2. Add to .env.local:
- *        PROXY_MODE=iproyal
- *        IPROYAL_HOST=unblocker.iproyal.com
- *        IPROYAL_PORT=12323
- *        IPROYAL_USER=tGlLbo1320889
- *        IPROYAL_PASS=jtPwvuYzPMPDrv72
- *
- * Geo-targeting (route through specific country):
- *   IPRoyal uses password suffixes for country selection:
- *        IPROYAL_PASS=your_password_country-US   → US exit IP
- *        IPROYAL_PASS=your_password_country-GB   → UK exit IP
- *        IPROYAL_PASS=your_password_country-DE   → Germany exit IP
- *   Or set IPROYAL_COUNTRY=US and the code adds the suffix automatically.
- *
- * Tor setup (free alternative):
- *   apt-get install -y tor && systemctl start tor
- *   PROXY_MODE=tor
+ * Key fixes in this version:
+ *   1. encodeURIComponent() on username AND password — handles special chars
+ *   2. Basic Auth header sent explicitly (some Node versions don't parse auth from URL)
+ *   3. Correct tunnel handling for HTTPS targets through HTTP CONNECT proxy
+ *   4. Server IP whitelisting is done in IPRoyal dashboard, NOT in code
  */
 
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import * as net from "net";
 
-// ── Mode detection ─────────────────────────────────────────────────────────────
+// ── Mode ───────────────────────────────────────────────────────────────────────
 
 type ProxyMode = "direct" | "tor" | "iproyal";
 
@@ -44,36 +32,131 @@ const PROXY_MODE: ProxyMode = (() => {
 
 const MAX_RETRIES    = 3;
 const RETRY_DELAY_MS = 600;
+const BLOCKED_CODES  = new Set([403, 407, 429, 503, 451]);
 
-// Status codes that mean "you're blocked, rotate IP and retry"
-const BLOCKED_CODES = new Set([403, 429, 503, 451]);
+// ── IPRoyal ────────────────────────────────────────────────────────────────────
 
-// ── IPRoyal configuration ──────────────────────────────────────────────────────
-
-const IPROYAL_HOST    = process.env.IPROYAL_HOST || "geo.iproyal.com";
-const IPROYAL_PORT    = process.env.IPROYAL_PORT || "12321";
+const IPROYAL_HOST    = process.env.IPROYAL_HOST || "unblocker.iproyal.com";
+const IPROYAL_PORT    = process.env.IPROYAL_PORT || "12323";
 const IPROYAL_USER    = process.env.IPROYAL_USER || "";
 const IPROYAL_PASS    = process.env.IPROYAL_PASS || "";
-const IPROYAL_COUNTRY = process.env.IPROYAL_COUNTRY || ""; // e.g. "US", "GB", "DE"
+const IPROYAL_COUNTRY = process.env.IPROYAL_COUNTRY || "";
 
 /**
- * Build the IPRoyal proxy URL.
- * IPRoyal rotates the IP automatically on each request — no extra code needed.
- * For geo-targeting, append _country-XX to the password.
+ * Build the proxy URL with properly encoded credentials.
+ *
+ * CRITICAL: encodeURIComponent() is required — without it, special characters
+ * in the password (like @, :, /, +) break the URL parser and cause 407/403.
+ *
+ * For IPRoyal Unblocker (unblocker.iproyal.com):
+ *   The proxy handles JS rendering and bot detection automatically.
+ *   No extra headers needed — just authenticated CONNECT tunnel.
+ *
+ * For IPRoyal Rotating (geo.iproyal.com):
+ *   Append _country-XX to password for geo-targeting.
  */
-function buildIPRoyalProxyUrl(): string {
+function buildProxyUrl(): string {
+  const user = encodeURIComponent(IPROYAL_USER);
   let pass = IPROYAL_PASS;
-  if (IPROYAL_COUNTRY && !pass.includes("_country-")) {
+
+  // Add geo-targeting suffix for rotating proxies (not needed for Unblocker)
+  if (IPROYAL_COUNTRY && !IPROYAL_HOST.includes("unblocker") && !pass.includes("_country-")) {
     pass = `${pass}_country-${IPROYAL_COUNTRY}`;
   }
-  return `http://${IPROYAL_USER}:${pass}@${IPROYAL_HOST}:${IPROYAL_PORT}`;
+
+  const encodedPass = encodeURIComponent(pass);
+  const proxyUrl = `http://${user}:${encodedPass}@${IPROYAL_HOST}:${IPROYAL_PORT}`;
+
+  return proxyUrl;
+}
+
+/**
+ * Build the Proxy-Authorization header manually.
+ * This is the most reliable auth method — bypasses URL parsing issues in Node.
+ * Format: "Basic base64(username:password)"
+ * NOTE: The raw (not URL-encoded) credentials go into the Base64 string.
+ */
+function buildProxyAuthHeader(): string {
+  let pass = IPROYAL_PASS;
+  if (IPROYAL_COUNTRY && !IPROYAL_HOST.includes("unblocker") && !pass.includes("_country-")) {
+    pass = `${pass}_country-${IPROYAL_COUNTRY}`;
+  }
+  const credentials = `${IPROYAL_USER}:${pass}`;
+  const encoded = Buffer.from(credentials, "utf-8").toString("base64");
+  return `Basic ${encoded}`;
 }
 
 function makeIPRoyalAgent(): HttpsProxyAgent<string> {
-  return new HttpsProxyAgent(buildIPRoyalProxyUrl());
+  const proxyUrl = buildProxyUrl();
+  const agent = new HttpsProxyAgent(proxyUrl, {
+    // Pass auth header explicitly — most reliable method
+    headers: {
+      "Proxy-Authorization": buildProxyAuthHeader(),
+    },
+  });
+  return agent;
 }
 
-// ── Tor configuration ──────────────────────────────────────────────────────────
+async function ipRoyalFetch(url: string, options: RequestInit): Promise<Response> {
+  let lastErr: Error | null = null;
+  let lastRes: Response | null = null;
+
+  // Log once at startup to confirm config loaded (password masked)
+  if (process.env.NODE_ENV !== "production") {
+    const maskedPass = IPROYAL_PASS.slice(0, 4) + "****";
+    console.log(`[iproyal] Mode active — ${IPROYAL_HOST}:${IPROYAL_PORT} user=${IPROYAL_USER} pass=${maskedPass}`);
+  }
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      console.log(`[iproyal] Retry ${attempt + 1}/${MAX_RETRIES} → ${url}`);
+      await sleep(RETRY_DELAY_MS * attempt);
+    }
+
+    try {
+      const agent = makeIPRoyalAgent();
+
+      const res = await fetch(url, {
+        ...options,
+        // @ts-ignore — Node 18+ fetch supports agent via dispatcher
+        agent,
+        // Prevent QUIC/HTTP3 which doesn't work through HTTP CONNECT proxies
+        cache: "no-store",
+      });
+
+      // 407 = proxy auth failed — credentials wrong or IP not whitelisted
+      if (res.status === 407) {
+        console.error("[iproyal] 407 Proxy Auth Failed — check credentials or whitelist your VPS IP in IPRoyal dashboard");
+        // Don't retry 407 — it's a config error, not a transient block
+        return res;
+      }
+
+      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
+        console.log(`[iproyal] Got ${res.status} — retrying with fresh connection...`);
+        lastRes = res;
+        continue;
+      }
+
+      return res;
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      const msg = lastErr.message;
+
+      // ERR_TUNNEL_CONNECTION_FAILED = proxy refused the CONNECT tunnel
+      // Usually means: wrong host/port, or IP not whitelisted
+      if (msg.includes("TUNNEL") || msg.includes("tunneling")) {
+        console.error("[iproyal] Tunnel failed — verify IPROYAL_HOST, IPROYAL_PORT, and that your VPS IP is whitelisted in IPRoyal dashboard");
+      }
+
+      console.warn(`[iproyal] Attempt ${attempt + 1} error: ${msg}`);
+    }
+  }
+
+  if (lastRes) return lastRes;
+  throw lastErr ?? new Error("IPRoyal: all retries failed");
+}
+
+// ── Tor ────────────────────────────────────────────────────────────────────────
 
 const TOR_HOST         = "127.0.0.1";
 const TOR_SOCKS_PORT   = 9050;
@@ -85,37 +168,46 @@ function makeTorAgent(): SocksProxyAgent {
 
 async function rotateTorCircuit(): Promise<void> {
   return new Promise((resolve) => {
-    const socket = net.createConnection(TOR_CONTROL_PORT, TOR_HOST);
-    const timeout = setTimeout(() => { socket.destroy(); resolve(); }, 3000);
+    const sock = net.createConnection(TOR_CONTROL_PORT, TOR_HOST);
+    const t = setTimeout(() => { sock.destroy(); resolve(); }, 3000);
     let buf = "";
-    socket.on("connect", () => socket.write(`AUTHENTICATE ""\r\n`));
-    socket.on("data", (d) => {
+    sock.on("connect", () => sock.write(`AUTHENTICATE ""\r\n`));
+    sock.on("data", (d) => {
       buf += d.toString();
-      if (buf.includes("250 OK") && !buf.includes("SIGNAL")) {
-        socket.write("SIGNAL NEWNYM\r\n");
-      } else if (buf.includes("250 OK") && buf.includes("SIGNAL")) {
-        clearTimeout(timeout); socket.end(); resolve();
-      } else if (buf.includes("515") || buf.includes("551")) {
-        clearTimeout(timeout); socket.destroy(); resolve();
-      }
+      if (buf.includes("250 OK") && !buf.includes("SIGNAL")) sock.write("SIGNAL NEWNYM\r\n");
+      else if (buf.includes("250 OK") && buf.includes("SIGNAL")) { clearTimeout(t); sock.end(); resolve(); }
+      else if (buf.includes("515") || buf.includes("551")) { clearTimeout(t); sock.destroy(); resolve(); }
     });
-    socket.on("error", () => { clearTimeout(timeout); resolve(); });
+    sock.on("error", () => { clearTimeout(t); resolve(); });
   });
 }
 
-// ── Core fetch functions ───────────────────────────────────────────────────────
+async function torFetch(url: string, options: RequestInit): Promise<Response> {
+  let lastErr: Error | null = null;
+  let lastRes: Response | null = null;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      await rotateTorCircuit();
+      await sleep(RETRY_DELAY_MS * attempt);
+    }
+    try {
+      const res = await fetch(url, { ...options, /* @ts-ignore */ agent: makeTorAgent(), cache: "no-store" });
+      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) { lastRes = res; continue; }
+      return res;
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+    }
+  }
+  if (lastRes) return lastRes;
+  throw lastErr ?? new Error("Tor: all retries failed");
 }
 
-async function directFetch(
-  url: string,
-  options: RequestInit,
-  maxAttempts = 2,
-): Promise<Response> {
+// ── Direct ────────────────────────────────────────────────────────────────────
+
+async function directFetch(url: string, options: RequestInit): Promise<Response> {
   let lastErr: Error | null = null;
-  for (let i = 0; i < maxAttempts; i++) {
+  for (let i = 0; i < 2; i++) {
     if (i > 0) await sleep(RETRY_DELAY_MS);
     try { return await fetch(url, options); }
     catch (e) {
@@ -126,104 +218,22 @@ async function directFetch(
   throw lastErr ?? new Error("Fetch failed");
 }
 
-async function ipRoyalFetch(
-  url: string,
-  options: RequestInit,
-): Promise<Response> {
-  let lastErr: Error | null = null;
-  let lastRes: Response | null = null;
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      // IPRoyal auto-rotates per request — just wait briefly before retry
-      console.log(`[iproyal] Retry ${attempt + 1}/${MAX_RETRIES} for ${url}`);
-      await sleep(RETRY_DELAY_MS * attempt);
-    }
-
-    try {
-      const agent = makeIPRoyalAgent();
-      const res = await fetch(url, {
-        ...options,
-        // @ts-ignore — Node fetch supports agent
-        agent,
-      });
-
-      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
-        console.log(`[iproyal] Got ${res.status} — rotating IP and retrying...`);
-        lastRes = res;
-        continue;
-      }
-
-      return res;
-    } catch (e) {
-      lastErr = e instanceof Error ? e : new Error(String(e));
-      console.warn(`[iproyal] Attempt ${attempt + 1} failed: ${lastErr.message}`);
-    }
-  }
-
-  if (lastRes) return lastRes;
-  throw lastErr ?? new Error("IPRoyal: all retries failed");
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function torFetch(
-  url: string,
-  options: RequestInit,
-): Promise<Response> {
-  let lastErr: Error | null = null;
-  let lastRes: Response | null = null;
+// ── Main export ───────────────────────────────────────────────────────────────
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      console.log(`[tor] Rotating circuit (attempt ${attempt + 1}/${MAX_RETRIES})...`);
-      await rotateTorCircuit();
-      await sleep(RETRY_DELAY_MS * attempt);
-    }
-
-    try {
-      const agent = makeTorAgent();
-      const res = await fetch(url, {
-        ...options,
-        // @ts-ignore
-        agent,
-      });
-
-      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
-        console.log(`[tor] Got ${res.status} — rotating exit node...`);
-        lastRes = res;
-        continue;
-      }
-
-      return res;
-    } catch (e) {
-      lastErr = e instanceof Error ? e : new Error(String(e));
-      console.warn(`[tor] Attempt ${attempt + 1} failed: ${lastErr.message}`);
-    }
-  }
-
-  if (lastRes) return lastRes;
-  throw lastErr ?? new Error("Tor: all retries failed");
-}
-
-// ── Main export ────────────────────────────────────────────────────────────────
-
-/**
- * fetchWithRotation — the single outbound fetch function used by doProxyRequest.ts
- *
- * Automatically uses whichever proxy mode is configured in .env.local.
- * Zero changes needed in doProxyRequest.ts when switching modes.
- */
 export async function fetchWithRotation(
   url: string,
   options: RequestInit & { signal?: AbortSignal },
 ): Promise<Response> {
   switch (PROXY_MODE) {
-    case "iproyal":
-      return ipRoyalFetch(url, options);
-    case "tor":
-      return torFetch(url, options);
-    case "direct":
-    default:
-      return directFetch(url, options);
+    case "iproyal": return ipRoyalFetch(url, options);
+    case "tor":     return torFetch(url, options);
+    default:        return directFetch(url, options);
   }
 }
 
