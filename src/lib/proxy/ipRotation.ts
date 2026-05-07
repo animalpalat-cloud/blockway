@@ -1,193 +1,230 @@
 /**
- * ipRotation.ts — Outbound IP rotation via Tor SOCKS5
+ * ipRotation.ts — Outbound IP rotation
  *
- * How it works:
- *   All outbound fetch requests go through Tor's SOCKS5 proxy (127.0.0.1:9050).
- *   Tor automatically routes requests through different exit nodes globally.
- *   If a request gets blocked (403/429/connection reset), we request a new
- *   Tor circuit and retry — effectively changing our exit IP.
+ * Supports three modes, set via environment variables:
  *
- * Requirements on VPS:
- *   apt-get install -y tor
- *   systemctl enable tor && systemctl start tor
+ *   MODE=direct  (default) — No proxy, direct fetch with retry
+ *   MODE=tor               — Route through Tor SOCKS5 (free, slow)
+ *   MODE=iproyal           — Route through IPRoyal residential proxies (paid, fast)
  *
- * Tor gives a new IP roughly every 10 seconds or when we send NEWNYM signal.
- * We send NEWNYM on 403/429 responses to rotate immediately.
+ * IPRoyal setup:
+ *   1. Sign up at iproyal.com → Residential Proxies
+ *   2. Add to .env.local:
+ *        PROXY_MODE=iproyal
+ *        IPROYAL_HOST=unblocker.iproyal.com
+ *        IPROYAL_PORT=12323
+ *        IPROYAL_USER=tGlLbo1320889
+ *        IPROYAL_PASS=jtPwvuYzPMPDrv72
+ *
+ * Geo-targeting (route through specific country):
+ *   IPRoyal uses password suffixes for country selection:
+ *        IPROYAL_PASS=your_password_country-US   → US exit IP
+ *        IPROYAL_PASS=your_password_country-GB   → UK exit IP
+ *        IPROYAL_PASS=your_password_country-DE   → Germany exit IP
+ *   Or set IPROYAL_COUNTRY=US and the code adds the suffix automatically.
+ *
+ * Tor setup (free alternative):
+ *   apt-get install -y tor && systemctl start tor
+ *   PROXY_MODE=tor
  */
 
-import { Agent } from "https";
 import { SocksProxyAgent } from "socks-proxy-agent";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import * as net from "net";
 
-// ── Configuration ─────────────────────────────────────────────────────────────
+// ── Mode detection ─────────────────────────────────────────────────────────────
 
-const TOR_SOCKS5_HOST = "127.0.0.1";
-const TOR_SOCKS5_PORT = 9050;
-const TOR_CONTROL_PORT = 9051;
-const TOR_CONTROL_PASSWORD = ""; // empty = no auth (our torrc config)
+type ProxyMode = "direct" | "tor" | "iproyal";
 
-const USE_TOR = process.env.USE_TOR === "true" || process.env.USE_TOR === "1";
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 800;
+const PROXY_MODE: ProxyMode = (() => {
+  const m = (process.env.PROXY_MODE || "direct").toLowerCase();
+  if (m === "tor" || m === "iproyal" || m === "direct") return m as ProxyMode;
+  return "direct";
+})();
 
-// HTTP status codes we treat as "blocked" → rotate IP and retry
-const BLOCKED_STATUS_CODES = new Set([403, 429, 503, 451]);
+const MAX_RETRIES    = 3;
+const RETRY_DELAY_MS = 600;
 
-// ── Tor circuit rotation ───────────────────────────────────────────────────────
+// Status codes that mean "you're blocked, rotate IP and retry"
+const BLOCKED_CODES = new Set([403, 429, 503, 451]);
+
+// ── IPRoyal configuration ──────────────────────────────────────────────────────
+
+const IPROYAL_HOST    = process.env.IPROYAL_HOST || "geo.iproyal.com";
+const IPROYAL_PORT    = process.env.IPROYAL_PORT || "12321";
+const IPROYAL_USER    = process.env.IPROYAL_USER || "";
+const IPROYAL_PASS    = process.env.IPROYAL_PASS || "";
+const IPROYAL_COUNTRY = process.env.IPROYAL_COUNTRY || ""; // e.g. "US", "GB", "DE"
 
 /**
- * Send NEWNYM signal to Tor control port.
- * This asks Tor to build a new circuit with a different exit node.
- * The new circuit is ready in ~2-5 seconds.
+ * Build the IPRoyal proxy URL.
+ * IPRoyal rotates the IP automatically on each request — no extra code needed.
+ * For geo-targeting, append _country-XX to the password.
  */
+function buildIPRoyalProxyUrl(): string {
+  let pass = IPROYAL_PASS;
+  if (IPROYAL_COUNTRY && !pass.includes("_country-")) {
+    pass = `${pass}_country-${IPROYAL_COUNTRY}`;
+  }
+  return `http://${IPROYAL_USER}:${pass}@${IPROYAL_HOST}:${IPROYAL_PORT}`;
+}
+
+function makeIPRoyalAgent(): HttpsProxyAgent<string> {
+  return new HttpsProxyAgent(buildIPRoyalProxyUrl());
+}
+
+// ── Tor configuration ──────────────────────────────────────────────────────────
+
+const TOR_HOST         = "127.0.0.1";
+const TOR_SOCKS_PORT   = 9050;
+const TOR_CONTROL_PORT = 9051;
+
+function makeTorAgent(): SocksProxyAgent {
+  return new SocksProxyAgent(`socks5://${TOR_HOST}:${TOR_SOCKS_PORT}`, { timeout: 20000 });
+}
+
 async function rotateTorCircuit(): Promise<void> {
   return new Promise((resolve) => {
-    const socket = net.createConnection(TOR_CONTROL_PORT, TOR_CONTROL_HOST());
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      resolve(); // don't block on failure
-    }, 3000);
-
-    socket.on("connect", () => {
-      // Authenticate (empty password = AUTHENTICATE "")
-      const auth = TOR_CONTROL_PASSWORD
-        ? `AUTHENTICATE "${TOR_CONTROL_PASSWORD}"\r\n`
-        : `AUTHENTICATE ""\r\n`;
-      socket.write(auth);
-    });
-
-    let buffer = "";
-    socket.on("data", (data) => {
-      buffer += data.toString();
-      if (buffer.includes("250 OK") && !buffer.includes("SIGNAL")) {
-        // Auth succeeded, send NEWNYM
+    const socket = net.createConnection(TOR_CONTROL_PORT, TOR_HOST);
+    const timeout = setTimeout(() => { socket.destroy(); resolve(); }, 3000);
+    let buf = "";
+    socket.on("connect", () => socket.write(`AUTHENTICATE ""\r\n`));
+    socket.on("data", (d) => {
+      buf += d.toString();
+      if (buf.includes("250 OK") && !buf.includes("SIGNAL")) {
         socket.write("SIGNAL NEWNYM\r\n");
-      } else if (buffer.includes("250 OK") && buffer.includes("SIGNAL")) {
-        // NEWNYM acknowledged
-        clearTimeout(timeout);
-        socket.end();
-        resolve();
-      } else if (buffer.includes("515") || buffer.includes("551")) {
-        // Auth failed or error
-        clearTimeout(timeout);
-        socket.destroy();
-        resolve();
+      } else if (buf.includes("250 OK") && buf.includes("SIGNAL")) {
+        clearTimeout(timeout); socket.end(); resolve();
+      } else if (buf.includes("515") || buf.includes("551")) {
+        clearTimeout(timeout); socket.destroy(); resolve();
       }
     });
-
-    socket.on("error", () => {
-      clearTimeout(timeout);
-      resolve(); // don't crash on Tor control failure
-    });
+    socket.on("error", () => { clearTimeout(timeout); resolve(); });
   });
 }
 
-function TOR_CONTROL_HOST(): string {
-  return TOR_SOCKS5_HOST;
+// ── Core fetch functions ───────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-// ── Tor-enabled fetch ──────────────────────────────────────────────────────────
-
-/**
- * Build a SOCKS5 agent that routes through Tor.
- * Each call creates a fresh agent (no connection reuse across circuits).
- */
-function makeTorAgent(): SocksProxyAgent {
-  return new SocksProxyAgent(
-    `socks5://${TOR_SOCKS5_HOST}:${TOR_SOCKS5_PORT}`,
-    { timeout: 20000 }
-  );
-}
-
-/**
- * Fetch a URL with automatic Tor-based IP rotation on block.
- *
- * @param url       Target URL
- * @param options   Standard RequestInit options (method, headers, body, signal)
- * @returns         The Response from the target server
- */
-export async function fetchWithRotation(
+async function directFetch(
   url: string,
-  options: RequestInit & { signal?: AbortSignal },
+  options: RequestInit,
+  maxAttempts = 2,
 ): Promise<Response> {
-  // If Tor is not enabled, fall through to normal fetch with retry
-  if (!USE_TOR) {
-    return fetchWithRetry(url, options);
+  let lastErr: Error | null = null;
+  for (let i = 0; i < maxAttempts; i++) {
+    if (i > 0) await sleep(RETRY_DELAY_MS);
+    try { return await fetch(url, options); }
+    catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      if (lastErr.name === "AbortError") throw lastErr;
+    }
   }
+  throw lastErr ?? new Error("Fetch failed");
+}
 
-  let lastError: Error | null = null;
-  let lastResponse: Response | null = null;
+async function ipRoyalFetch(
+  url: string,
+  options: RequestInit,
+): Promise<Response> {
+  let lastErr: Error | null = null;
+  let lastRes: Response | null = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     if (attempt > 0) {
-      // Rotate Tor circuit before retry
+      // IPRoyal auto-rotates per request — just wait briefly before retry
+      console.log(`[iproyal] Retry ${attempt + 1}/${MAX_RETRIES} for ${url}`);
+      await sleep(RETRY_DELAY_MS * attempt);
+    }
+
+    try {
+      const agent = makeIPRoyalAgent();
+      const res = await fetch(url, {
+        ...options,
+        // @ts-ignore — Node fetch supports agent
+        agent,
+      });
+
+      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
+        console.log(`[iproyal] Got ${res.status} — rotating IP and retrying...`);
+        lastRes = res;
+        continue;
+      }
+
+      return res;
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      console.warn(`[iproyal] Attempt ${attempt + 1} failed: ${lastErr.message}`);
+    }
+  }
+
+  if (lastRes) return lastRes;
+  throw lastErr ?? new Error("IPRoyal: all retries failed");
+}
+
+async function torFetch(
+  url: string,
+  options: RequestInit,
+): Promise<Response> {
+  let lastErr: Error | null = null;
+  let lastRes: Response | null = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
       console.log(`[tor] Rotating circuit (attempt ${attempt + 1}/${MAX_RETRIES})...`);
       await rotateTorCircuit();
-      // Wait for new circuit to be ready
       await sleep(RETRY_DELAY_MS * attempt);
     }
 
     try {
       const agent = makeTorAgent();
-
-      const response = await fetch(url, {
+      const res = await fetch(url, {
         ...options,
-        // @ts-ignore — Node fetch supports agent for SOCKS5
+        // @ts-ignore
         agent,
       });
 
-      // Check if we're blocked
-      if (BLOCKED_STATUS_CODES.has(response.status) && attempt < MAX_RETRIES - 1) {
-        console.log(`[tor] Got ${response.status} from ${url}, rotating IP...`);
-        lastResponse = response;
+      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
+        console.log(`[tor] Got ${res.status} — rotating exit node...`);
+        lastRes = res;
         continue;
       }
 
-      return response;
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      console.warn(`[tor] Fetch failed attempt ${attempt + 1}: ${lastError.message}`);
-
-      if (attempt === MAX_RETRIES - 1) break;
+      return res;
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      console.warn(`[tor] Attempt ${attempt + 1} failed: ${lastErr.message}`);
     }
   }
 
-  // All attempts failed — if we have a response, return it; otherwise throw
-  if (lastResponse) return lastResponse;
-  throw lastError ?? new Error("All retry attempts failed");
+  if (lastRes) return lastRes;
+  throw lastErr ?? new Error("Tor: all retries failed");
 }
+
+// ── Main export ────────────────────────────────────────────────────────────────
 
 /**
- * Fetch without Tor but with simple retry on network errors.
- * Used when USE_TOR=false or as fallback.
+ * fetchWithRotation — the single outbound fetch function used by doProxyRequest.ts
+ *
+ * Automatically uses whichever proxy mode is configured in .env.local.
+ * Zero changes needed in doProxyRequest.ts when switching modes.
  */
-async function fetchWithRetry(
+export async function fetchWithRotation(
   url: string,
   options: RequestInit & { signal?: AbortSignal },
-  maxAttempts = 2,
 ): Promise<Response> {
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (attempt > 0) {
-      await sleep(RETRY_DELAY_MS);
-    }
-    try {
-      return await fetch(url, options);
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      // Only retry on network errors, not on AbortError
-      if (lastError.name === "AbortError") throw lastError;
-    }
+  switch (PROXY_MODE) {
+    case "iproyal":
+      return ipRoyalFetch(url, options);
+    case "tor":
+      return torFetch(url, options);
+    case "direct":
+    default:
+      return directFetch(url, options);
   }
-
-  throw lastError ?? new Error("Fetch failed");
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ── Exports ───────────────────────────────────────────────────────────────────
-
-export { USE_TOR, MAX_RETRIES, BLOCKED_STATUS_CODES };
+export { PROXY_MODE, BLOCKED_CODES };

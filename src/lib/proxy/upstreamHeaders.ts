@@ -212,3 +212,4 @@ export const STRIP_FROM_RESPONSE = new Set([
   "permissions-policy",
   "feature-policy",
 ]);
+
