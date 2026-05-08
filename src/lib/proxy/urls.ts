@@ -91,6 +91,24 @@ export function isBlockedTarget(url: URL): boolean {
 
 // ─── Rewrite helpers ───────────────────────────────────────────────────────────
 
+// Hosts we never proxy — leave their URLs unchanged.
+// These are trusted public CDNs that:
+//   1. Don't need IP rotation (publicly accessible)
+//   2. Are faster served directly
+//   3. Would waste our proxy bandwidth
+const PASSTHROUGH_HOSTS = new Set([
+  "fonts.googleapis.com",
+  "fonts.gstatic.com",
+  "ajax.googleapis.com",
+  "maps.googleapis.com",
+  "accounts.google.com",      // Google auth — proxying breaks OAuth
+  "ssl.google-analytics.com",
+  "www.google-analytics.com",
+  "cdn.jsdelivr.net",
+  "cdnjs.cloudflare.com",
+  "unpkg.com",
+]);
+
 export function skipRewrite(v: string): boolean {
   const t = (v ?? "").trim().toLowerCase();
   if (!t) return true;
@@ -98,6 +116,13 @@ export function skipRewrite(v: string): boolean {
       t.startsWith("mailto:") || t.startsWith("tel:") || t.startsWith("about:") ||
       t === "void(0)" || t === "void(0);") return true;
   if (t.startsWith("blob:") || t.startsWith("chrome-extension:")) return true;
+
+  // Leave passthrough CDN URLs as-is — no proxy needed
+  try {
+    const u = new URL(t);
+    if (PASSTHROUGH_HOSTS.has(u.hostname)) return true;
+  } catch { /* not a full URL, continue */ }
+
   return false;
 }
 

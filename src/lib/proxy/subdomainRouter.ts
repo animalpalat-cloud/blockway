@@ -65,6 +65,7 @@ export function isSubdomainModeEnabled(): boolean {
 // www.youtube.com → www--youtube--com.daddyproxy.com would be 4 levels and fail DNS.
 // So we canonicalize: www.youtube.com → youtube.com → youtube--com.daddyproxy.com
 const WWW_STRIP_HOSTS = new Set([
+  // Major sites — strip www. to keep subdomain to single level
   "youtube.com",
   "google.com",
   "facebook.com",
@@ -84,6 +85,16 @@ const WWW_STRIP_HOSTS = new Set([
   "ebay.com",
   "dailymotion.com",
   "vimeo.com",
+  "xhamster.com",
+  "xhamster18.com",
+  "xvideos.com",
+  "pornhub.com",
+  "xnxx.com",
+  "xaccess.com",
+  "xhaccess.com",
+  "bing.com",
+  "yahoo.com",
+  "duckduckgo.com",
 ]);
 
 export function encodeHostToSubdomain(hostname: string): string {

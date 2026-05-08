@@ -246,6 +246,39 @@ export async function doProxy(
   const ct = contentType.toLowerCase();
   const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
   const isCss  = ct.includes("text/css");
+  const isJs   = ct.includes("javascript") || ct.includes("ecmascript");
+
+  // CRITICAL FIX: If upstream returned an error status for a JS/CSS/font file,
+  // return an empty body with correct content-type instead of the HTML error page.
+  // Without this fix: browser gets HTML error page when expecting JS → "Unexpected token '<'"
+  const requestedAsJs  = request.nextUrl.pathname.endsWith(".js")  ||
+                         (request.nextUrl.searchParams.get("url") || "").includes(".js");
+  const requestedAsCss = request.nextUrl.pathname.endsWith(".css") ||
+                         (request.nextUrl.searchParams.get("url") || "").includes(".css");
+
+  if (upstream.status >= 400 && (requestedAsJs || isJs)) {
+    // Return empty JS instead of HTML error — prevents "Unexpected token '<'"
+    const emptyJs = new NextResponse("/* proxy: upstream error " + upstream.status + " */", {
+      status: 200,
+      headers: { "content-type": "application/javascript; charset=utf-8",
+                 "cache-control": "no-store" },
+    });
+    applyCorsHeaders(emptyJs.headers, requestOrigin);
+    attachSessionCookie(emptyJs, sessionId);
+    return emptyJs;
+  }
+
+  if (upstream.status >= 400 && requestedAsCss) {
+    // Return empty CSS instead of HTML error
+    const emptyCss = new NextResponse("/* proxy: upstream error " + upstream.status + " */", {
+      status: 200,
+      headers: { "content-type": "text/css; charset=utf-8",
+                 "cache-control": "no-store" },
+    });
+    applyCorsHeaders(emptyCss.headers, requestOrigin);
+    attachSessionCookie(emptyCss, sessionId);
+    return emptyCss;
+  }
 
   const sniffHtml =
     (!apiLike && isHtml) ||
