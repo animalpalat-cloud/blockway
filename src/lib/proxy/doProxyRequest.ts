@@ -107,11 +107,10 @@ function errResponse(msg: string, status: number, sid: string, origin?: string):
 //   Body: <html><head>...</head><body><pre style="...">HTML_ENCODED_CONTENT</pre></body></html>
 //   The actual content is HTML-entity-encoded inside <pre>
 //
-// This function normalizes ALL formats into the actual content.
+// FORMAT 3 — Double-wrapped (rare):
+//   Same as Format 2 but the <pre> content is wrapped again
 //
-// IMPORTANT: We use lastIndexOf('</pre>') rather than a non-greedy regex so
-// that proxied JS/HTML containing the literal string </pre> inside a string
-// literal does NOT truncate the extracted content.
+// This function normalizes ALL formats into the actual content.
 
 function normalizeIPRoyalResponse(raw: Buffer): { buf: Buffer; wasWrapped: boolean } {
   const str = raw.toString("utf-8");
@@ -125,15 +124,15 @@ function normalizeIPRoyalResponse(raw: Buffer): { buf: Buffer; wasWrapped: boole
   }
 
   // Locate the opening <pre …> tag and its closing </pre>
-  // Using indexOf / lastIndexOf instead of a regex avoids the truncation bug
-  // that a non-greedy [\s\S]*? causes when </pre> appears inside the content.
+  // Using indexOf / lastIndexOf instead of a non-greedy regex avoids the
+  // truncation bug where </pre> inside proxied JS/HTML cuts off the content.
   const preTagStart = str.indexOf("<pre");
   if (preTagStart === -1) return { buf: raw, wasWrapped: false };
 
   const openTagEnd = str.indexOf(">", preTagStart);
   if (openTagEnd === -1) return { buf: raw, wasWrapped: false };
 
-  // Use lastIndexOf so that any </pre> inside the encoded JS/HTML is skipped
+  // lastIndexOf so any </pre> inside the encoded content is skipped
   const preEnd = str.lastIndexOf("</pre>");
   if (preEnd === -1 || preEnd <= openTagEnd) return { buf: raw, wasWrapped: false };
 
@@ -208,8 +207,7 @@ export async function doProxy(
   const apiLike = isApiLike(request);
 
   // ── Puppeteer path ──────────────────────────────────────────────────────────
-  // Never run Puppeteer on static sub-resources (JS, CSS, fonts) — they are
-  // always fetched via the fast path. Puppeteer is only for top-level HTML docs.
+  // Never run Puppeteer on static sub-resources (JS, CSS, fonts).
   const isStaticAsset = requestedType === "js" || requestedType === "css" || requestedType === "font";
   if (method === "GET" && !apiLike && !isStaticAsset && shouldRenderHtmlWithPuppeteer(request, parsed)) {
     try {

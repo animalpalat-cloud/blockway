@@ -357,5 +357,100 @@ export function buildClientRuntimePatch(
   // under a non-suspicious name for cross-script use.
   try { window.__bwProxy = p; } catch (e) {}
 
+
+  // ─── 15. Prototype-level src/href patching ────────────────────────────────
+  // Intercepts ALL assignments to src/href on known element types, regardless
+  // of HOW the element was created (createElement, cloneNode, insertAdjacentHTML).
+  // Primary defence against direct iframe creation bypassing section 9 —
+  // critical for YouTube signin_passive and similar auth iframes.
+  (function () {
+    function patchProtoProp(ctor, propName) {
+      if (!ctor || !ctor.prototype) return;
+      var desc = Object.getOwnPropertyDescriptor(ctor.prototype, propName);
+      if (!desc || !desc.set) return;
+      var origGet = desc.get;
+      var origSet = desc.set;
+      Object.defineProperty(ctor.prototype, propName, {
+        get: origGet,
+        set: function (v) {
+          try {
+            if (typeof v === "string" && !isSkip(v) && !isAlreadyProxied(v)) v = p(v);
+          } catch (e) {}
+          origSet.call(this, v);
+        },
+        configurable: true,
+        enumerable: desc.enumerable || false,
+      });
+    }
+    try { patchProtoProp(HTMLIFrameElement,  "src");  } catch (e) {}
+    try { patchProtoProp(HTMLScriptElement,  "src");  } catch (e) {}
+    try { patchProtoProp(HTMLImageElement,   "src");  } catch (e) {}
+    try { patchProtoProp(HTMLVideoElement,   "src");  } catch (e) {}
+    try { patchProtoProp(HTMLAudioElement,   "src");  } catch (e) {}
+    try { patchProtoProp(HTMLEmbedElement,   "src");  } catch (e) {}
+    try { patchProtoProp(HTMLLinkElement,    "href"); } catch (e) {}
+    try { patchProtoProp(HTMLAnchorElement,  "href"); } catch (e) {}
+  })();
+
+  // ─── 16. MutationObserver — catch innerHTML / insertAdjacentHTML elements ──
+  // Prototype patching cannot intercept the HTML parser used by innerHTML /
+  // insertAdjacentHTML. This observer fires before the browser starts loading
+  // the new element's resource (microtask queue, ahead of network requests).
+  (function () {
+    function rewriteAddedNode(node) {
+      if (!node || node.nodeType !== 1) return;
+      var tag = (node.tagName || "").toLowerCase();
+      var attr = null;
+      if (tag === "iframe" || tag === "script" || tag === "img" ||
+          tag === "embed"  || tag === "source"  || tag === "video" || tag === "audio") {
+        attr = "src";
+      } else if (tag === "link") {
+        attr = "href";
+      }
+      if (attr) {
+        var v = node.getAttribute(attr);
+        if (v && !isSkip(v) && !isAlreadyProxied(v)) {
+          try {
+            var pv = p(v);
+            if (pv !== v) node.setAttribute(attr, pv);
+          } catch (e) {}
+        }
+      }
+      // Recurse into children (e.g. a <div> containing nested iframes)
+      try {
+        var ch = node.children;
+        for (var i = 0; i < ch.length; i++) rewriteAddedNode(ch[i]);
+      } catch (e) {}
+    }
+    try {
+      var _mutObs = new MutationObserver(function (mutations) {
+        for (var mi = 0; mi < mutations.length; mi++) {
+          var added = mutations[mi].addedNodes;
+          for (var ni = 0; ni < added.length; ni++) rewriteAddedNode(added[ni]);
+        }
+      });
+      var _docRoot = document.documentElement || document.body;
+      if (_docRoot) _mutObs.observe(_docRoot, { childList: true, subtree: true });
+    } catch (e) {}
+  })();
+
+  // ─── 17. document.createElementNS patch ──────────────────────────────────
+  // React, SVG players, and other libraries use createElementNS instead of
+  // createElement. Patch it identically to section 9.
+  var _origCreateNS = document.createElementNS;
+  if (_origCreateNS) {
+    document.createElementNS = function (ns, tag) {
+      var el = _origCreateNS.call(document, ns, tag);
+      var tl = (tag || "").toLowerCase();
+      if (tl === "script" || tl === "img" || tl === "iframe" ||
+          tl === "source" || tl === "video" || tl === "audio" || tl === "embed") {
+        _patchAttr(el, "src");
+      } else if (tl === "link") {
+        _patchAttr(el, "href");
+      }
+      return el;
+    };
+  }
+
 })();`;
 }
