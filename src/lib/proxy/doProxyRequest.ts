@@ -21,43 +21,41 @@ const CORS_ALLOW_HEADERS =
   "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, " +
   "User-Agent, Cookie, Range, X-Requested-With, Origin, Referer, " +
   "X-Forwarded-For, DNT, Cache-Control, Pragma, " +
-  "X-Request-ID, X-Request-Id, X-Client-ID, X-Client-Info, X-Api-Key, X-Api-Version, " +
-  "X-Trace-ID, X-Correlation-ID, X-Session-ID, X-User-Agent, X-Device-ID, " +
-  "X-Platform, X-App-Version, X-Build-Version, X-Access-Token, X-Auth-Token, " +
-  "X-CSRF-Token, X-Csrf-Token, X-Custom-Header, X-Forwarded-Host, " +
+  "X-Request-ID, X-Request-Id, X-Client-ID, X-Client-Info, X-Api-Key, " +
+  "X-CSRF-Token, X-Csrf-Token, X-Access-Token, X-Auth-Token, " +
   "If-Modified-Since, If-None-Match, If-Range, If-Unmodified-Since";
 const CORS_EXPOSE_HEADERS =
   "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render";
 
-const STREAMING_CONTENT_TYPES = [
-  "video/", "audio/", "application/octet-stream",
+// ONLY real media goes through streaming — everything else is buffered
+// so we can inspect and unwrap IPRoyal wrappers
+const STREAMING_TYPES = [
+  "video/", "audio/",
   "application/x-mpegurl", "application/vnd.apple.mpegurl",
-  "application/dash+xml", "video/mp4", "video/webm",
-  "video/ogg", "audio/mpeg", "audio/ogg",
+  "application/dash+xml",
 ];
 
 type HttpMethod = "GET" | "POST" | "HEAD" | "PUT" | "PATCH" | "DELETE";
 
-function isApiLikeRequest(request: NextRequest): boolean {
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function isApiLike(request: NextRequest): boolean {
   const accept = (request.headers.get("accept") || "").toLowerCase();
   if (accept.includes("application/json") && !accept.includes("text/html")) return true;
-  const ctype = (request.headers.get("content-type") || "").toLowerCase();
-  if (ctype.includes("application/json")) return true;
-  const xhr = (request.headers.get("x-requested-with") || "").toLowerCase();
-  return xhr === "xmlhttprequest";
+  const ct = (request.headers.get("content-type") || "").toLowerCase();
+  if (ct.includes("application/json")) return true;
+  return (request.headers.get("x-requested-with") || "").toLowerCase() === "xmlhttprequest";
 }
 
-function isStreamingContentType(ct: string): boolean {
+function isStreaming(ct: string): boolean {
   const c = ct.toLowerCase();
-  return STREAMING_CONTENT_TYPES.some((t) => c.includes(t));
+  return STREAMING_TYPES.some((t) => c.includes(t));
 }
 
-function applyCorsHeaders(headers: Headers, requestOrigin?: string): void {
-  const origin = requestOrigin || "*";
-  headers.set("access-control-allow-origin", origin);
-  if (origin !== "*") {
-    headers.set("access-control-allow-credentials", "true");
-  }
+function applyCorHeaders(headers: Headers, origin?: string): void {
+  const o = origin || "*";
+  headers.set("access-control-allow-origin", o);
+  if (o !== "*") headers.set("access-control-allow-credentials", "true");
   headers.set("access-control-allow-methods", CORS_ALLOW_METHODS);
   headers.set("access-control-allow-headers", CORS_ALLOW_HEADERS);
   headers.set("access-control-max-age", "86400");
@@ -65,262 +63,332 @@ function applyCorsHeaders(headers: Headers, requestOrigin?: string): void {
   headers.set("vary", "Origin");
 }
 
-function getSessionId(request: NextRequest): string {
+function stripSecurityHeaders(headers: Headers): void {
+  // These headers break proxying — must always be removed
+  headers.delete("content-security-policy");
+  headers.delete("content-security-policy-report-only");
+  headers.delete("x-frame-options");        // Allows YouTube/Facebook to render in proxy
+  headers.delete("x-content-type-options");
+  headers.delete("strict-transport-security");
+  headers.delete("alt-svc");               // Prevents QUIC/HTTP3 issues
+}
+
+function getSession(request: NextRequest): string {
   return request.cookies.get(SESSION_COOKIE)?.value || newSessionId();
 }
 
-function attachSessionCookie(res: NextResponse, sessionId: string): void {
+function setSessionCookie(res: NextResponse, sid: string): void {
   const root = getRootDomain();
-  const cookieOptions: Parameters<typeof res.cookies.set>[2] = {
-    path:     "/",
-    maxAge:   COOKIE_MAX_AGE,
-    httpOnly: true,
-    sameSite: "lax",
-    secure:   process.env.NODE_ENV === "production",
+  const opts: Parameters<typeof res.cookies.set>[2] = {
+    path: "/", maxAge: COOKIE_MAX_AGE, httpOnly: true,
+    sameSite: "lax", secure: process.env.NODE_ENV === "production",
   };
-  if (root) {
-    (cookieOptions as Record<string, unknown>)["domain"] = `.${root}`;
-  }
-  res.cookies.set(SESSION_COOKIE, sessionId, cookieOptions);
+  if (root) (opts as Record<string, unknown>)["domain"] = `.${root}`;
+  res.cookies.set(SESSION_COOKIE, sid, opts);
 }
 
-function errorJson(message: string, status: number, sessionId: string, origin?: string): NextResponse {
-  const res = NextResponse.json({ error: message }, { status });
-  applyCorsHeaders(res.headers, origin);
-  attachSessionCookie(res, sessionId);
+function errResponse(msg: string, status: number, sid: string, origin?: string): NextResponse {
+  const res = NextResponse.json({ error: msg }, { status });
+  applyCorHeaders(res.headers, origin);
+  setSessionCookie(res, sid);
   return res;
 }
 
-function buildStreamingResponse(
-  upstream: Response,
-  sessionId: string,
-  finalUrl: string,
-  requestOrigin?: string,
+// ─── IPRoyal Response Normalizer ──────────────────────────────────────────────
+//
+// IPRoyal Unblocker can return responses in MULTIPLE formats:
+//
+// FORMAT 1 — Normal response (most sites):
+//   Content-Type: text/html / application/javascript / etc.
+//   Body: actual content directly
+//
+// FORMAT 2 — HTML-wrapped response (YouTube JS, some APIs):
+//   Content-Type: text/plain
+//   Body: <html><head>...</head><body><pre style="...">HTML_ENCODED_CONTENT</pre></body></html>
+//   The actual content is HTML-entity-encoded inside <pre>
+//
+// FORMAT 3 — Double-wrapped (rare):
+//   Same as Format 2 but the <pre> content is wrapped again
+//
+// This function normalizes ALL formats into the actual content.
+
+function normalizeIPRoyalResponse(raw: Buffer): { buf: Buffer; wasWrapped: boolean } {
+  // Quick check — only process if starts with <html
+  const start = raw.slice(0, 10).toString("utf-8").trimStart().toLowerCase();
+  if (!start.startsWith("<html")) {
+    return { buf: raw, wasWrapped: false };
+  }
+
+  const str = raw.toString("utf-8");
+
+  // Try to extract content from <pre> tag (IPRoyal wrapper pattern)
+  const preMatch = str.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
+  if (!preMatch || !preMatch[1]) {
+    // Has <html> but no <pre> — this IS the actual HTML page, not a wrapper
+    // Only treat as wrapper if it has the specific IPRoyal meta tags
+    const hasIPRoyalMeta = str.includes('name="referrer"') &&
+                           str.includes('name="viewport"') &&
+                           str.includes("word-wrap: break-word");
+    if (!hasIPRoyalMeta) return { buf: raw, wasWrapped: false };
+    return { buf: raw, wasWrapped: false };
+  }
+
+  // Check if this looks like an IPRoyal wrapper
+  // (has their specific meta tags OR the pre has HTML-encoded content)
+  const preContent = preMatch[1];
+  const hasHTMLEntities = preContent.includes("&lt;") ||
+                          preContent.includes("&amp;") ||
+                          preContent.includes("&gt;");
+
+  const hasIPRoyalSignature = str.includes('name="referrer"') ||
+                              str.includes('name="color-scheme"') ||
+                              str.includes("word-wrap: break-word");
+
+  if (!hasIPRoyalSignature && !hasHTMLEntities) {
+    // Regular HTML page, not a wrapper
+    return { buf: raw, wasWrapped: false };
+  }
+
+  // Decode HTML entities from the <pre> content
+  const decoded = preContent
+    .replace(/&amp;/g,  "&")
+    .replace(/&lt;/g,   "<")
+    .replace(/&gt;/g,   ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g,  "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, "/")
+    .replace(/&#x60;/g, "`")
+    .replace(/&#x3D;/g, "=");
+
+  console.log("[proxy] Unwrapped IPRoyal HTML wrapper, decoded length:", decoded.length);
+  return { buf: Buffer.from(decoded, "utf-8"), wasWrapped: true };
+}
+
+// ─── What content type does the request expect? ───────────────────────────────
+function detectRequestedType(request: NextRequest): "js" | "css" | "html" | "other" {
+  const url = request.nextUrl.searchParams.get("url") || request.nextUrl.pathname;
+  if (/\.(js|mjs|jsx)(\?|$|#|&)/.test(url)) return "js";
+  if (/\.css(\?|$|#|&)/.test(url)) return "css";
+  const accept = (request.headers.get("accept") || "").toLowerCase();
+  if (accept.includes("text/html")) return "html";
+  return "other";
+}
+
+// ─── Streaming response builder ───────────────────────────────────────────────
+function buildStreamResponse(
+  upstream: Response, sid: string, finalUrl: string, origin?: string,
 ): NextResponse {
-  const resHeaders = new Headers();
-  upstream.headers.forEach((value, key) => {
-    const k = key.toLowerCase();
-    if (STRIP_FROM_RESPONSE.has(k)) return;
-    if (["content-type", "content-range", "accept-ranges", "content-length",
-         "last-modified", "etag", "x-content-duration", "cache-control"].includes(k)) {
-      resHeaders.set(key, value);
+  const h = new Headers();
+  upstream.headers.forEach((v, k) => {
+    const kl = k.toLowerCase();
+    if (!STRIP_FROM_RESPONSE.has(kl) &&
+        ["content-type","content-range","accept-ranges","content-length",
+         "last-modified","etag","cache-control"].includes(kl)) {
+      h.set(k, v);
     }
   });
-  applyCorsHeaders(resHeaders, requestOrigin);
-  resHeaders.set("x-proxy-final-url", finalUrl);
-  resHeaders.set("x-proxy-render", "stream");
-  resHeaders.delete("content-security-policy");
-  resHeaders.delete("content-security-policy-report-only");
-  const res = new NextResponse(upstream.body, { status: upstream.status, headers: resHeaders });
-  attachSessionCookie(res, sessionId);
+  applyCorHeaders(h, origin);
+  stripSecurityHeaders(h);
+  h.set("x-proxy-final-url", finalUrl);
+  h.set("x-proxy-render", "stream");
+  const res = new NextResponse(upstream.body, { status: upstream.status, headers: h });
   return res;
 }
 
-function buildPuppeteerProxyResponse(
-  body: Buffer,
-  options: { status: number; sessionId: string; jarHost: string; finalUrl: string; requestOrigin?: string },
-): NextResponse {
-  const { status, sessionId, jarHost, finalUrl, requestOrigin } = options;
-  const resHeaders = new Headers();
-  resHeaders.set("content-type", "text/html; charset=utf-8");
-  resHeaders.set("x-proxy-render", "puppeteer");
-  resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
-  resHeaders.set("pragma", "no-cache");
-  applyCorsHeaders(resHeaders, requestOrigin);
-  resHeaders.set("x-proxy-final-url", finalUrl);
-  resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
-  const res = new NextResponse(new Uint8Array(body), { status, headers: resHeaders });
-  attachSessionCookie(res, sessionId);
-  return res;
-}
-
+// ─── Main proxy function ──────────────────────────────────────────────────────
 export async function doProxy(
   request: NextRequest,
   targetUrlStr: string,
   method: HttpMethod = "GET",
 ): Promise<NextResponse> {
-  const sessionId = getSessionId(request);
-  const requestOrigin = request.headers.get("origin") ?? undefined;
+  const sid = getSession(request);
+  const origin = request.headers.get("origin") ?? undefined;
+  const requestedType = detectRequestedType(request);
 
   const parsed = normalizeUrl(targetUrlStr);
-  if (!parsed) return errorJson("Invalid URL.", 400, sessionId);
-  if (isBlockedTarget(parsed)) {
-    return errorJson("Target URL is blocked for security reasons.", 403, sessionId);
-  }
+  if (!parsed) return errResponse("Invalid URL.", 400, sid);
+  if (isBlockedTarget(parsed)) return errResponse("Target blocked.", 403, sid);
 
   const jarHost = parsed.hostname;
-
-  const rawRef = request.nextUrl.searchParams.get("ref") ??
-    (() => {
-      const raw = request.url;
-      const qi = raw.indexOf("?");
-      if (qi === -1) return null;
-      const qs = raw.slice(qi + 1);
-      for (const part of qs.split("&")) {
-        if (part.startsWith("ref=")) {
-          try { return decodeURIComponent(part.slice(4)); } catch { return part.slice(4); }
-        }
-      }
-      return null;
-    })();
-
+  const rawRef = request.nextUrl.searchParams.get("ref") ?? null;
   const documentReferer = safeDocumentRefererParam(rawRef);
   const maxBytes = MAX_SIZE_MB * 1024 * 1024;
-  const apiLike = isApiLikeRequest(request);
+  const apiLike = isApiLike(request);
 
-  // Puppeteer render path (JS-heavy sites)
+  // ── Puppeteer path ──────────────────────────────────────────────────────────
   if (method === "GET" && !apiLike && shouldRenderHtmlWithPuppeteer(request, parsed)) {
     try {
-      const r = await renderWithPuppeteer(
-        parsed, request.headers, sessionId, jarHost, documentReferer,
-      );
-      absorbPuppeteerCookies(sessionId, r.cookies);
+      const r = await renderWithPuppeteer(parsed, request.headers, sid, jarHost, documentReferer);
+      absorbPuppeteerCookies(sid, r.cookies);
       const out = Buffer.from(rewriteHtml(r.html, r.finalUrl, false, request.url), "utf-8");
-      if (out.length > maxBytes) return errorJson("Response too large.", 413, sessionId);
-      return buildPuppeteerProxyResponse(out, {
-        status: r.status, sessionId, jarHost, finalUrl: r.finalUrl, requestOrigin,
-      });
+      if (out.length > maxBytes) return errResponse("Response too large.", 413, sid);
+      const h = new Headers();
+      h.set("content-type", "text/html; charset=utf-8");
+      h.set("x-proxy-render", "puppeteer");
+      h.set("cache-control", "no-store");
+      applyCorHeaders(h, origin);
+      h.set("x-proxy-final-url", r.finalUrl);
+      const res = new NextResponse(new Uint8Array(out), { status: r.status, headers: h });
+      setSessionCookie(res, sid);
+      return res;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Puppeteer render failed.";
-      console.error("[proxy] Puppeteer failed, falling back to fetch:", msg);
+      console.error("[proxy] Puppeteer failed:", err instanceof Error ? err.message : err);
     }
   }
 
-  // Standard fetch path with auto-rotation
+  // ── Fetch path ──────────────────────────────────────────────────────────────
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
 
   const upstreamHeaders = buildUpstreamRequestHeaders(
-    request.headers, parsed, { sessionId, jarHost, documentReferer },
+    request.headers, parsed, { sessionId: sid, jarHost, documentReferer },
   );
-
   const rangeHeader = request.headers.get("range");
   if (rangeHeader) upstreamHeaders.set("range", rangeHeader);
 
   let upstream: Response;
   try {
-    let body: ArrayBuffer | undefined;
+    let bodyData: ArrayBuffer | undefined;
     if (method !== "GET" && method !== "HEAD") {
-      body = await request.arrayBuffer();
+      bodyData = await request.arrayBuffer();
     }
-
-    // fetchWithRotation handles: auto-retry on 403/429, Tor circuit rotation if USE_TOR=true
     upstream = await fetchWithRotation(parsed.toString(), {
       method,
       redirect: "follow",
       signal:   controller.signal,
       headers:  upstreamHeaders,
-      body,
-      // @ts-ignore — prevents QUIC/HTTP3 which causes ERR_QUIC_PROTOCOL_ERROR
-      cache: "no-store",
+      body:     bodyData,
+      // @ts-ignore
+      cache:    "no-store",
     });
   } catch (err) {
     clearTimeout(timer);
     if (err instanceof Error && err.name === "AbortError") {
-      return errorJson("Request timed out.", 504, sessionId);
+      return errResponse("Request timed out.", 504, sid);
     }
-    const msg = err instanceof Error ? err.message : "Could not reach target URL.";
-    return errorJson(msg, 502, sessionId);
+    return errResponse(err instanceof Error ? err.message : "Fetch failed.", 502, sid);
   }
   clearTimeout(timer);
 
-  absorbSetCookieHeaders(sessionId, jarHost, upstream.headers);
+  absorbSetCookieHeaders(sid, jarHost, upstream.headers);
 
   const contentType = upstream.headers.get("content-type") ?? "application/octet-stream";
-  const finalUrl = upstream.url || parsed.toString();
+  const finalUrl    = upstream.url || parsed.toString();
 
-  if (isStreamingContentType(contentType) && upstream.body) {
-    return buildStreamingResponse(upstream, sessionId, finalUrl, requestOrigin);
+  // ── Streaming path (real media only) ────────────────────────────────────────
+  if (isStreaming(contentType) && upstream.body) {
+    const res = buildStreamResponse(upstream, sid, finalUrl, origin);
+    setSessionCookie(res, sid);
+    return res;
   }
 
+  // ── Buffer the response ─────────────────────────────────────────────────────
   const cl = Number(upstream.headers.get("content-length") ?? 0);
-  if (cl && cl > maxBytes) return errorJson("Response too large.", 413, sessionId);
+  if (cl > maxBytes) return errResponse("Response too large.", 413, sid);
 
   const hasBody = method !== "HEAD";
-  const buf = hasBody
+  let buf: Buffer = hasBody
     ? Buffer.from(await upstream.arrayBuffer())
     : Buffer.alloc(0);
 
-  if (buf.length > maxBytes) return errorJson("Response too large.", 413, sessionId);
+  if (buf.length > maxBytes) return errResponse("Response too large.", 413, sid);
 
+  // ── STEP 1: Return empty stub for blocked JS/CSS ────────────────────────────
+  // Prevents "Unexpected token '<'" — browser gets empty JS instead of HTML error
+  if (upstream.status >= 400) {
+    if (requestedType === "js") {
+      const res = new NextResponse(`/* proxy: ${upstream.status} */`, {
+        status: 200,
+        headers: { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-store" },
+      });
+      applyCorHeaders(res.headers, origin);
+      setSessionCookie(res, sid);
+      return res;
+    }
+    if (requestedType === "css") {
+      const res = new NextResponse(`/* proxy: ${upstream.status} */`, {
+        status: 200,
+        headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-store" },
+      });
+      applyCorHeaders(res.headers, origin);
+      setSessionCookie(res, sid);
+      return res;
+    }
+  }
+
+  // ── STEP 2: Unwrap IPRoyal HTML wrapper ─────────────────────────────────────
+  // Handles ALL IPRoyal wrapper formats — see normalizeIPRoyalResponse() above
+  if (hasBody && buf.length > 0) {
+    const { buf: unwrapped, wasWrapped } = normalizeIPRoyalResponse(buf);
+    if (wasWrapped) buf = unwrapped;
+  }
+
+  // ── STEP 3: Detect actual content type after unwrapping ─────────────────────
   const ct = contentType.toLowerCase();
   const isHtml = ct.includes("text/html") || ct.includes("application/xhtml+xml");
   const isCss  = ct.includes("text/css");
   const isJs   = ct.includes("javascript") || ct.includes("ecmascript");
 
-  // CRITICAL FIX: If upstream returned an error status for a JS/CSS/font file,
-  // return an empty body with correct content-type instead of the HTML error page.
-  // Without this fix: browser gets HTML error page when expecting JS → "Unexpected token '<'"
-  const requestedAsJs  = request.nextUrl.pathname.endsWith(".js")  ||
-                         (request.nextUrl.searchParams.get("url") || "").includes(".js");
-  const requestedAsCss = request.nextUrl.pathname.endsWith(".css") ||
-                         (request.nextUrl.searchParams.get("url") || "").includes(".css");
+  // After unwrapping, check if content actually looks like HTML
+  const preview = buf.slice(0, 512).toString("utf-8");
+  const contentIsHtml = /^\s*(<!(DOCTYPE|doctype)\s+html|<html[\s>]|<head[\s>])/.test(preview);
 
-  if (upstream.status >= 400 && (requestedAsJs || isJs)) {
-    // Return empty JS instead of HTML error — prevents "Unexpected token '<'"
-    const emptyJs = new NextResponse("/* proxy: upstream error " + upstream.status + " */", {
-      status: 200,
-      headers: { "content-type": "application/javascript; charset=utf-8",
-                 "cache-control": "no-store" },
-    });
-    applyCorsHeaders(emptyJs.headers, requestOrigin);
-    attachSessionCookie(emptyJs, sessionId);
-    return emptyJs;
-  }
-
-  if (upstream.status >= 400 && requestedAsCss) {
-    // Return empty CSS instead of HTML error
-    const emptyCss = new NextResponse("/* proxy: upstream error " + upstream.status + " */", {
-      status: 200,
-      headers: { "content-type": "text/css; charset=utf-8",
-                 "cache-control": "no-store" },
-    });
-    applyCorsHeaders(emptyCss.headers, requestOrigin);
-    attachSessionCookie(emptyCss, sessionId);
-    return emptyCss;
-  }
-
+  // Sniff HTML: trust content-type OR detect from content
+  // But NEVER treat JS/CSS URLs as HTML even if content-type says text/plain
   const sniffHtml =
     (!apiLike && isHtml) ||
-    (!apiLike && ct.includes("text/plain") && /^\s*</.test(buf.toString("utf-8", 0, 512)));
+    (!apiLike && requestedType !== "js" && requestedType !== "css" &&
+     ct.includes("text/plain") && contentIsHtml);
 
+  // ── STEP 4: Force correct content-type for JS requests ─────────────────────
+  // If URL was for JS but IPRoyal returned text/plain, treat as JS
+  const treatAsJs  = requestedType === "js"  || isJs;
+  const treatAsCss = requestedType === "css" || isCss;
+
+  // ── STEP 5: Rewrite content ─────────────────────────────────────────────────
   let responseBody: Buffer = buf;
   if (hasBody && sniffHtml) {
-    responseBody = Buffer.from(rewriteHtml(buf.toString("utf-8"), finalUrl, true, request.url), "utf-8");
-  } else if (hasBody && isCss) {
+    responseBody = Buffer.from(
+      rewriteHtml(buf.toString("utf-8"), finalUrl, true, request.url),
+      "utf-8",
+    );
+  } else if (hasBody && treatAsCss && !sniffHtml) {
     responseBody = Buffer.from(rewriteCss(buf.toString("utf-8"), finalUrl), "utf-8");
   }
+  // JS: pass through as-is (already unwrapped in step 2)
 
+  // ── STEP 6: Build response ──────────────────────────────────────────────────
   const resHeaders = new Headers();
-  upstream.headers.forEach((value, key) => {
-    if (!STRIP_FROM_RESPONSE.has(key.toLowerCase())) {
-      resHeaders.set(key, value);
-    }
+  upstream.headers.forEach((v, k) => {
+    if (!STRIP_FROM_RESPONSE.has(k.toLowerCase())) resHeaders.set(k, v);
   });
 
-  if (!apiLike && sniffHtml) resHeaders.set("content-type", "text/html; charset=utf-8");
-  else if (!apiLike && isCss) resHeaders.set("content-type", "text/css; charset=utf-8");
+  // Set correct content-type
+  if (sniffHtml)       resHeaders.set("content-type", "text/html; charset=utf-8");
+  else if (treatAsCss) resHeaders.set("content-type", "text/css; charset=utf-8");
+  else if (treatAsJs)  resHeaders.set("content-type", "application/javascript; charset=utf-8");
+
+  // Strip ALL headers that block proxying
+  stripSecurityHeaders(resHeaders);
 
   resHeaders.set("x-proxy-render", "fetch");
-  resHeaders.delete("content-security-policy");
-  resHeaders.delete("content-security-policy-report-only");
   resHeaders.set("cache-control", "no-store, no-cache, must-revalidate, private, max-age=0");
   resHeaders.set("pragma", "no-cache");
   resHeaders.delete("age");
   resHeaders.delete("expires");
-
-  applyCorsHeaders(resHeaders, requestOrigin);
-  resHeaders.set("x-proxy-final-url", finalUrl);
-  resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sessionId, jarHost) ? "1" : "0");
-
   resHeaders.delete("content-length");
   resHeaders.delete("content-encoding");
   resHeaders.delete("transfer-encoding");
 
-  const res = new NextResponse(
-    new Uint8Array(responseBody),
-    { status: upstream.status, headers: resHeaders },
-  );
-  attachSessionCookie(res, sessionId);
+  applyCorHeaders(resHeaders, origin);
+  resHeaders.set("x-proxy-final-url", finalUrl);
+  resHeaders.set("x-proxy-cookie-replay", cookieHeaderForHost(sid, jarHost) ? "1" : "0");
+
+  const res = new NextResponse(new Uint8Array(responseBody), {
+    status: upstream.status,
+    headers: resHeaders,
+  });
+  setSessionCookie(res, sid);
   return res;
 }
