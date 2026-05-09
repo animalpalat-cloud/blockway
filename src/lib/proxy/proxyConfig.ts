@@ -11,6 +11,19 @@ export const MAX_SIZE_MB = Number(process.env.PROXY_MAX_SIZE_MB) || 32;
 export const PROXY_PUPPETEER_ENABLED = process.env.PROXY_PUPPETEER !== "0";
 
 /**
+ * Static asset extensions that must never be sent through Puppeteer.
+ * These are always fetched via the direct fetch path regardless of host rules.
+ * Sending JS/CSS/font URLs to Puppeteer causes them to be rendered as HTML
+ * documents, returning the wrong content type and breaking page loading.
+ */
+const STATIC_ASSET_RE =
+  /\.(js|mjs|cjs|jsx|ts|tsx|css|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|ico|avif|mp4|webm|mp3|ogg|wav|pdf|zip|gz|wasm|map|json)(\?|#|$)/i;
+
+export function isStaticAssetUrl(target: URL): boolean {
+  return STATIC_ASSET_RE.test(target.pathname);
+}
+
+/**
  * Sites that are known to require full browser rendering.
  * These are sent through Puppeteer automatically.
  */
@@ -80,13 +93,21 @@ function looksLikeCloudflareProtected(_request: NextRequest, target: URL): boole
 
 /**
  * Determines whether the top-level HTML document should be fetched via Puppeteer.
- * Individual sub-resources (CSS, JS, images) always use the fast fetch path.
+ * Individual sub-resources (CSS, JS, fonts, images) always use the fast fetch path.
+ *
+ * NOTE: The static-asset guard is also enforced in doProxyRequest.ts via the
+ * `isStaticAsset` check before this function is even called. This check is a
+ * second line of defence in case shouldRenderHtmlWithPuppeteer is called directly.
  */
 export function shouldRenderHtmlWithPuppeteer(
   request: NextRequest,
   target: URL,
 ): boolean {
   if (!PROXY_PUPPETEER_ENABLED) return false;
+
+  // Never use Puppeteer for static assets — they must go through the fast fetch
+  // path so we can apply the IPRoyal unwrap and correct content-type headers.
+  if (isStaticAssetUrl(target)) return false;
 
   // Explicit override via query param
   const sp = request.nextUrl.searchParams;
