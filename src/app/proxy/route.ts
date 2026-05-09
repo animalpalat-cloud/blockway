@@ -1,3 +1,10 @@
+/**
+ * src/app/proxy/route.ts
+ *
+ * Main proxy route handler. All browser requests go through here.
+ * Handles Google batchexecute, CORS preflight, and all HTTP methods.
+ */
+
 import { doProxy } from "@/lib/proxy/doProxyRequest";
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -12,7 +19,8 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers":
     "Content-Type, Accept, Accept-Language, Accept-Encoding, Authorization, " +
     "User-Agent, Cookie, Range, X-Requested-With, Origin, Referer, " +
-    "X-Forwarded-For, DNT, Cache-Control, Pragma",
+    "X-Forwarded-For, DNT, Cache-Control, Pragma, " +
+    "X-Same-Domain, X-Goog-AuthUser, X-Goog-Encode-Response-If-Executable",
   "Access-Control-Expose-Headers":
     "x-proxy-final-url, content-type, x-proxy-cookie-replay, x-proxy-render",
   "Access-Control-Max-Age": "86400",
@@ -28,20 +36,9 @@ function jsonError(message: string, status: number) {
 }
 
 /**
- * Extract the raw `url` query param without Next.js auto-decoding it a second time.
- *
- * WHY: Next.js searchParams.get("url") auto-decodes the value once.
- * But our clientRuntime and sw.js encode target URLs with encodeURIComponent,
- * so the raw query string contains url=https%3A%2F%2Fexample.com%2Fpath.
- * Next.js decodes that to https://example.com/path — fine for simple URLs.
- * BUT for URLs with encoded slashes or special chars inside paths
- * (e.g. https%3A%2F%2Fxopen.com%2F becomes https://xopen.com/ and then
- * Next.js may further mangle it), we lose the original structure → 400.
- *
- * SOLUTION: Read the raw request.url string, find url=..., decode exactly once.
+ * Extract the raw `url` query param without Next.js auto-decoding it twice.
  */
 function extractTargetUrl(request: NextRequest): string {
-  // request.url is the full URL including origin and query string
   const raw = request.url;
   const qIdx = raw.indexOf("?");
   if (qIdx === -1) return "";
@@ -51,7 +48,6 @@ function extractTargetUrl(request: NextRequest): string {
       try {
         return decodeURIComponent(part.slice(4));
       } catch {
-        // If malformed encoding, return as-is
         return part.slice(4);
       }
     }
@@ -117,6 +113,8 @@ export async function DELETE(request: NextRequest) {
 }
 
 export async function OPTIONS(request: NextRequest) {
+  // Handle CORS preflight — must respond 204 with correct headers
+  // This is critical for Google batchexecute and XHR requests
   const reqHeaders = request.headers.get("access-control-request-headers");
   return new NextResponse(null, {
     status: 204,
