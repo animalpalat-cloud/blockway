@@ -7,11 +7,6 @@ export const PROXY_PUPPETEER_SETTLE_MS =
   Number(process.env.PROXY_PUPPETEER_SETTLE_MS) || 2_000;
 export const MAX_SIZE_MB = Number(process.env.PROXY_MAX_SIZE_MB) || 32;
 
-/**
- * Static asset extensions that must never go through Puppeteer.
- * These are always fetched via the direct path so the IPRoyal unwrap
- * and correct content-type logic in doProxyRequest can run.
- */
 const STATIC_ASSET_RE =
   /\.(js|mjs|cjs|jsx|css|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|ico|avif|mp4|webm|mp3|ogg|wav|wasm|map|json)(\?|#|$)/i;
 
@@ -100,8 +95,6 @@ export function shouldRenderHtmlWithPuppeteer(
 ): boolean {
   if (!PROXY_PUPPETEER_ENABLED) return false;
 
-  // Never use Puppeteer for static assets — they must go through the fast fetch
-  // path so IPRoyal unwrapping and correct content-type headers are applied.
   if (isStaticAssetUrl(target)) return false;
 
   // Explicit override via query param

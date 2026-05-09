@@ -114,41 +114,22 @@ function errResponse(msg: string, status: number, sid: string, origin?: string):
 
 function normalizeIPRoyalResponse(raw: Buffer): { buf: Buffer; wasWrapped: boolean } {
   const str = raw.toString("utf-8");
-
-  // Detect IPRoyal wrapper by their specific meta tags (fastest, most reliable check)
   const hasIPRoyalSignature =
     str.includes('name="referrer"') || str.includes('name="color-scheme"');
+  if (!hasIPRoyalSignature) return { buf: raw, wasWrapped: false };
 
-  if (!hasIPRoyalSignature) {
-    return { buf: raw, wasWrapped: false };
-  }
-
-  // Locate the opening <pre …> tag and its closing </pre>
-  // Using indexOf / lastIndexOf instead of a non-greedy regex avoids the
-  // truncation bug where </pre> inside proxied JS/HTML cuts off the content.
   const preTagStart = str.indexOf("<pre");
   if (preTagStart === -1) return { buf: raw, wasWrapped: false };
-
   const openTagEnd = str.indexOf(">", preTagStart);
   if (openTagEnd === -1) return { buf: raw, wasWrapped: false };
-
-  // lastIndexOf so any </pre> inside the encoded content is skipped
   const preEnd = str.lastIndexOf("</pre>");
   if (preEnd === -1 || preEnd <= openTagEnd) return { buf: raw, wasWrapped: false };
 
   const preContent = str.slice(openTagEnd + 1, preEnd);
-
-  // Decode HTML entities
   const decoded = preContent
-    .replace(/&amp;/g,  "&")
-    .replace(/&lt;/g,   "<")
-    .replace(/&gt;/g,   ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g,  "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, "/")
-    .replace(/&#x60;/g, "`")
-    .replace(/&#x3D;/g, "=");
+    .replace(/&amp;/g,  "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, "/").replace(/&#x60;/g, "`").replace(/&#x3D;/g, "=");
 
   console.log("[proxy] Unwrapped IPRoyal HTML wrapper, decoded length:", decoded.length);
   return { buf: Buffer.from(decoded, "utf-8"), wasWrapped: true };
@@ -207,7 +188,6 @@ export async function doProxy(
   const apiLike = isApiLike(request);
 
   // ── Puppeteer path ──────────────────────────────────────────────────────────
-  // Never run Puppeteer on static sub-resources (JS, CSS, fonts).
   const isStaticAsset = requestedType === "js" || requestedType === "css" || requestedType === "font";
   if (method === "GET" && !apiLike && !isStaticAsset && shouldRenderHtmlWithPuppeteer(request, parsed)) {
     try {
