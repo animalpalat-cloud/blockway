@@ -1,17 +1,16 @@
 /**
- * ipRotation.ts
+ * ipRotation.ts — Outbound fetch with IPRoyal Unblocker (undici official method)
  *
- * Uses IPRoyal's OFFICIAL method: undici ProxyAgent with dispatcher
- * This is the ONLY correct way to use IPRoyal Unblocker in Node.js
+ * IPRoyal MUST use undici ProxyAgent with dispatcher — not https-proxy-agent.
+ * Using the wrong method causes the HTML wrapper issue where IPRoyal wraps
+ * all responses in <html><body><pre>ENCODED_CONTENT</pre></body></html>
  *
  * PROXY_MODE=direct   — plain fetch with retry
- * PROXY_MODE=iproyal  — undici ProxyAgent (IPRoyal official method)
- * PROXY_MODE=tor      — SOCKS5 via socks-proxy-agent
+ * PROXY_MODE=iproyal  — undici ProxyAgent (CORRECT IPRoyal method)
+ * PROXY_MODE=tor      — SOCKS5 Tor
  */
 
 import * as net from "net";
-
-// ── Mode ───────────────────────────────────────────────────────────────────────
 
 type ProxyMode = "direct" | "tor" | "iproyal";
 
@@ -25,7 +24,7 @@ const MAX_RETRIES    = 3;
 const RETRY_DELAY_MS = 800;
 const BLOCKED_CODES  = new Set([403, 407, 429, 503, 451]);
 
-// ── IPRoyal config ─────────────────────────────────────────────────────────────
+// ── IPRoyal ────────────────────────────────────────────────────────────────────
 
 const IPROYAL_HOST    = process.env.IPROYAL_HOST || "unblocker.iproyal.com";
 const IPROYAL_PORT    = process.env.IPROYAL_PORT || "12323";
@@ -34,80 +33,79 @@ const IPROYAL_PASS    = process.env.IPROYAL_PASS || "";
 const IPROYAL_COUNTRY = process.env.IPROYAL_COUNTRY || "";
 
 function buildProxyUri(): string {
-  // Build password with optional geo-targeting suffix
   let pass = IPROYAL_PASS;
   if (IPROYAL_COUNTRY && !pass.includes("_country-")) {
     pass = `${pass}_country-${IPROYAL_COUNTRY.toLowerCase()}`;
   }
-  // Use raw credentials in URI — undici handles encoding internally
+  // Raw credentials — undici handles them correctly
   return `http://${IPROYAL_USER}:${pass}@${IPROYAL_HOST}:${IPROYAL_PORT}`;
 }
 
-// ── IPRoyal fetch using undici ProxyAgent ─────────────────────────────────────
-
 async function ipRoyalFetch(url: string, options: RequestInit): Promise<Response> {
-  // Dynamically import undici — avoids issues with Next.js bundling
+  // Use undici — the ONLY correct method for IPRoyal Unblocker
   const { fetch: undiciFetch, ProxyAgent } = await import("undici");
 
-  // Disable TLS verification for IPRoyal Unblocker
-  // (required as per IPRoyal's own documentation)
+  // Required by IPRoyal documentation
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
   const proxyUri = buildProxyUri();
   let lastErr: Error | null = null;
-  let lastRes: any = null;
+  let lastStatus = 0;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     if (attempt > 0) {
-      console.log(`[iproyal] Retry ${attempt + 1}/${MAX_RETRIES} → ${url}`);
+      console.log(`[iproyal] Retry ${attempt + 1}/${MAX_RETRIES}`);
       await sleep(RETRY_DELAY_MS * attempt);
     }
 
     try {
-      // Create fresh ProxyAgent per request (ensures IP rotation)
-      const dispatcher = new ProxyAgent(proxyUri);
+      // Fresh dispatcher per request = fresh IP rotation
+      const dispatcher = new ProxyAgent({
+        uri: proxyUri,
+        connect: { rejectUnauthorized: false },
+      });
 
-      // Extract headers from RequestInit
+      // Build headers object from RequestInit
       const reqHeaders: Record<string, string> = {};
       if (options.headers) {
-        const h = options.headers as Record<string, string>;
-        Object.keys(h).forEach((k) => { reqHeaders[k] = h[k]; });
+        if (options.headers instanceof Headers) {
+          options.headers.forEach((v, k) => { reqHeaders[k] = v; });
+        } else {
+          const h = options.headers as Record<string, string>;
+          Object.keys(h).forEach((k) => { reqHeaders[k] = h[k]; });
+        }
       }
 
-      // Use undici fetch with dispatcher — THIS IS THE CORRECT IPROYAL METHOD
-      const res = await undiciFetch(url, {
+      // undici fetch with dispatcher — THIS is how IPRoyal Unblocker works
+      const undiciRes = await undiciFetch(url, {
         method:     (options.method || "GET") as any,
         headers:    reqHeaders,
         body:       options.body as any,
         redirect:   "follow",
-        dispatcher, // ← This is how IPRoyal works
-      });
+        dispatcher,
+      } as any);
 
-      // 407 = wrong credentials or IP not whitelisted
-      if (res.status === 407) {
-        console.error("[iproyal] 407 Proxy Auth Failed — check credentials or whitelist VPS IP in IPRoyal dashboard");
-        // Convert undici response to standard Response
-        const body = await res.text();
-        return new Response(body, { status: 407, headers: Object.fromEntries(res.headers) });
+      lastStatus = undiciRes.status;
+
+      if (undiciRes.status === 407) {
+        console.error("[iproyal] 407 — check credentials or whitelist VPS IP in IPRoyal dashboard");
+        const b = await undiciRes.arrayBuffer();
+        const h = new Headers();
+        undiciRes.headers.forEach((v: string, k: string) => h.set(k, v));
+        return new Response(b, { status: 407, headers: h });
       }
 
-      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
-        console.log(`[iproyal] Got ${res.status} — retrying...`);
-        lastRes = res;
+      if (BLOCKED_CODES.has(undiciRes.status) && attempt < MAX_RETRIES - 1) {
+        console.log(`[iproyal] Got ${undiciRes.status} — retrying with fresh IP...`);
         continue;
       }
 
-      // Convert undici response to standard Web API Response
-      const responseBody = await res.arrayBuffer();
-      const responseHeaders = new Headers();
-      res.headers.forEach((value: string, key: string) => {
-        responseHeaders.set(key, value);
-      });
+      // Convert undici response → standard Web API Response
+      const body    = await undiciRes.arrayBuffer();
+      const headers = new Headers();
+      undiciRes.headers.forEach((v: string, k: string) => headers.set(k, v));
 
-      return new Response(responseBody, {
-        status:  res.status,
-        headers: responseHeaders,
-      });
+      return new Response(body, { status: undiciRes.status, headers });
 
     } catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
@@ -115,17 +113,10 @@ async function ipRoyalFetch(url: string, options: RequestInit): Promise<Response
     }
   }
 
-  if (lastRes) {
-    const body = await lastRes.arrayBuffer();
-    const headers = new Headers();
-    lastRes.headers.forEach((v: string, k: string) => headers.set(k, v));
-    return new Response(body, { status: lastRes.status, headers });
-  }
-
-  throw lastErr ?? new Error("IPRoyal: all retries failed");
+  throw lastErr ?? new Error(`IPRoyal: all retries failed (last status: ${lastStatus})`);
 }
 
-// ── Tor fetch ──────────────────────────────────────────────────────────────────
+// ── Tor ────────────────────────────────────────────────────────────────────────
 
 const TOR_HOST         = "127.0.0.1";
 const TOR_SOCKS_PORT   = 9050;
@@ -171,7 +162,7 @@ async function torFetch(url: string, options: RequestInit): Promise<Response> {
   throw lastErr ?? new Error("Tor: all retries failed");
 }
 
-// ── Direct fetch ───────────────────────────────────────────────────────────────
+// ── Direct ─────────────────────────────────────────────────────────────────────
 
 async function directFetch(url: string, options: RequestInit): Promise<Response> {
   let lastErr: Error | null = null;

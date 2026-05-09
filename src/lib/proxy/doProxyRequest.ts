@@ -113,34 +113,63 @@ function errResponse(msg: string, status: number, sid: string, origin?: string):
 // This function normalizes ALL formats into the actual content.
 
 function normalizeIPRoyalResponse(raw: Buffer): { buf: Buffer; wasWrapped: boolean } {
+  // Quick check — only process if starts with <html
+  const start = raw.slice(0, 10).toString("utf-8").trimStart().toLowerCase();
+  if (!start.startsWith("<html")) {
+    return { buf: raw, wasWrapped: false };
+  }
+
   const str = raw.toString("utf-8");
-  const hasIPRoyalSignature =
-    str.includes('name="referrer"') || str.includes('name="color-scheme"');
-  if (!hasIPRoyalSignature) return { buf: raw, wasWrapped: false };
 
-  const preTagStart = str.indexOf("<pre");
-  if (preTagStart === -1) return { buf: raw, wasWrapped: false };
-  const openTagEnd = str.indexOf(">", preTagStart);
-  if (openTagEnd === -1) return { buf: raw, wasWrapped: false };
-  const preEnd = str.lastIndexOf("</pre>");
-  if (preEnd === -1 || preEnd <= openTagEnd) return { buf: raw, wasWrapped: false };
+  // Try to extract content from <pre> tag (IPRoyal wrapper pattern)
+  const preMatch = str.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
+  if (!preMatch || !preMatch[1]) {
+    // Has <html> but no <pre> — this IS the actual HTML page, not a wrapper
+    // Only treat as wrapper if it has the specific IPRoyal meta tags
+    const hasIPRoyalMeta = str.includes('name="referrer"') &&
+                           str.includes('name="viewport"') &&
+                           str.includes("word-wrap: break-word");
+    if (!hasIPRoyalMeta) return { buf: raw, wasWrapped: false };
+    return { buf: raw, wasWrapped: false };
+  }
 
-  const preContent = str.slice(openTagEnd + 1, preEnd);
+  // Check if this looks like an IPRoyal wrapper
+  // (has their specific meta tags OR the pre has HTML-encoded content)
+  const preContent = preMatch[1];
+  const hasHTMLEntities = preContent.includes("&lt;") ||
+                          preContent.includes("&amp;") ||
+                          preContent.includes("&gt;");
+
+  const hasIPRoyalSignature = str.includes('name="referrer"') ||
+                              str.includes('name="color-scheme"') ||
+                              str.includes("word-wrap: break-word");
+
+  if (!hasIPRoyalSignature && !hasHTMLEntities) {
+    // Regular HTML page, not a wrapper
+    return { buf: raw, wasWrapped: false };
+  }
+
+  // Decode HTML entities from the <pre> content
   const decoded = preContent
-    .replace(/&amp;/g,  "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, "/").replace(/&#x60;/g, "`").replace(/&#x3D;/g, "=");
+    .replace(/&amp;/g,  "&")
+    .replace(/&lt;/g,   "<")
+    .replace(/&gt;/g,   ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g,  "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, "/")
+    .replace(/&#x60;/g, "`")
+    .replace(/&#x3D;/g, "=");
 
   console.log("[proxy] Unwrapped IPRoyal HTML wrapper, decoded length:", decoded.length);
   return { buf: Buffer.from(decoded, "utf-8"), wasWrapped: true };
 }
 
 // ─── What content type does the request expect? ───────────────────────────────
-function detectRequestedType(request: NextRequest): "js" | "css" | "html" | "font" | "other" {
+function detectRequestedType(request: NextRequest): "js" | "css" | "html" | "other" {
   const url = request.nextUrl.searchParams.get("url") || request.nextUrl.pathname;
   if (/\.(js|mjs|jsx)(\?|$|#|&)/.test(url)) return "js";
   if (/\.css(\?|$|#|&)/.test(url)) return "css";
-  if (/\.(woff2?|ttf|otf|eot)(\?|$|#|&)/.test(url)) return "font";
   const accept = (request.headers.get("accept") || "").toLowerCase();
   if (accept.includes("text/html")) return "html";
   return "other";
@@ -188,8 +217,7 @@ export async function doProxy(
   const apiLike = isApiLike(request);
 
   // ── Puppeteer path ──────────────────────────────────────────────────────────
-  const isStaticAsset = requestedType === "js" || requestedType === "css" || requestedType === "font";
-  if (method === "GET" && !apiLike && !isStaticAsset && shouldRenderHtmlWithPuppeteer(request, parsed)) {
+  if (method === "GET" && !apiLike && shouldRenderHtmlWithPuppeteer(request, parsed)) {
     try {
       const r = await renderWithPuppeteer(parsed, request.headers, sid, jarHost, documentReferer);
       absorbPuppeteerCookies(sid, r.cookies);
