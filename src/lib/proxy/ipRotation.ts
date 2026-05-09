@@ -1,17 +1,14 @@
 /**
  * ipRotation.ts
  *
- * Handles outbound fetch with three modes:
- *   PROXY_MODE=direct   — plain fetch with retry (default)
- *   PROXY_MODE=tor      — route through Tor SOCKS5
- *   PROXY_MODE=iproyal  — route through IPRoyal residential proxy
+ * Uses IPRoyal's OFFICIAL method: undici ProxyAgent with dispatcher
+ * This is the ONLY correct way to use IPRoyal Unblocker in Node.js
  *
- * The TypeScript "agent does not exist in RequestInit" error is fixed
- * by casting fetch options to (any) when passing the agent.
+ * PROXY_MODE=direct   — plain fetch with retry
+ * PROXY_MODE=iproyal  — undici ProxyAgent (IPRoyal official method)
+ * PROXY_MODE=tor      — SOCKS5 via socks-proxy-agent
  */
 
-import { SocksProxyAgent } from "socks-proxy-agent";
-import { HttpsProxyAgent } from "https-proxy-agent";
 import * as net from "net";
 
 // ── Mode ───────────────────────────────────────────────────────────────────────
@@ -20,17 +17,15 @@ type ProxyMode = "direct" | "tor" | "iproyal";
 
 const PROXY_MODE: ProxyMode = (() => {
   const m = (process.env.PROXY_MODE || "direct").toLowerCase();
-  if (m === "tor" || m === "iproyal") return m;
+  if (m === "tor" || m === "iproyal") return m as ProxyMode;
   return "direct";
 })();
 
 const MAX_RETRIES    = 3;
 const RETRY_DELAY_MS = 800;
+const BLOCKED_CODES  = new Set([403, 407, 429, 503, 451]);
 
-// Status codes that mean "blocked — rotate IP and retry"
-const BLOCKED_CODES = new Set([403, 407, 429, 503, 451]);
-
-// ── IPRoyal ────────────────────────────────────────────────────────────────────
+// ── IPRoyal config ─────────────────────────────────────────────────────────────
 
 const IPROYAL_HOST    = process.env.IPROYAL_HOST || "unblocker.iproyal.com";
 const IPROYAL_PORT    = process.env.IPROYAL_PORT || "12323";
@@ -38,38 +33,29 @@ const IPROYAL_USER    = process.env.IPROYAL_USER || "";
 const IPROYAL_PASS    = process.env.IPROYAL_PASS || "";
 const IPROYAL_COUNTRY = process.env.IPROYAL_COUNTRY || "";
 
-function buildIPRoyalProxyUrl(): string {
-  // encodeURIComponent is REQUIRED — special chars in password break URL parsing
-  const user = encodeURIComponent(IPROYAL_USER);
+function buildProxyUri(): string {
+  // Build password with optional geo-targeting suffix
   let pass = IPROYAL_PASS;
-
-  // Geo-targeting: append _country-XX to password (not needed for Unblocker)
-  if (IPROYAL_COUNTRY && !IPROYAL_HOST.includes("unblocker") && !pass.includes("_country-")) {
-    pass = `${pass}_country-${IPROYAL_COUNTRY}`;
+  if (IPROYAL_COUNTRY && !pass.includes("_country-")) {
+    pass = `${pass}_country-${IPROYAL_COUNTRY.toLowerCase()}`;
   }
-
-  return `http://${user}:${encodeURIComponent(pass)}@${IPROYAL_HOST}:${IPROYAL_PORT}`;
+  // Use raw credentials in URI — undici handles encoding internally
+  return `http://${IPROYAL_USER}:${pass}@${IPROYAL_HOST}:${IPROYAL_PORT}`;
 }
 
-function buildProxyAuthHeader(): string {
-  // Explicit Proxy-Authorization header — most reliable auth method
-  // Uses raw (not URL-encoded) credentials in Base64
-  let pass = IPROYAL_PASS;
-  if (IPROYAL_COUNTRY && !IPROYAL_HOST.includes("unblocker") && !pass.includes("_country-")) {
-    pass = `${pass}_country-${IPROYAL_COUNTRY}`;
-  }
-  return `Basic ${Buffer.from(`${IPROYAL_USER}:${pass}`, "utf-8").toString("base64")}`;
-}
-
-function makeIPRoyalAgent(): HttpsProxyAgent<string> {
-  return new HttpsProxyAgent(buildIPRoyalProxyUrl(), {
-    headers: { "Proxy-Authorization": buildProxyAuthHeader() },
-  });
-}
+// ── IPRoyal fetch using undici ProxyAgent ─────────────────────────────────────
 
 async function ipRoyalFetch(url: string, options: RequestInit): Promise<Response> {
+  // Dynamically import undici — avoids issues with Next.js bundling
+  const { fetch: undiciFetch, ProxyAgent } = await import("undici");
+
+  // Disable TLS verification for IPRoyal Unblocker
+  // (required as per IPRoyal's own documentation)
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+  const proxyUri = buildProxyUri();
   let lastErr: Error | null = null;
-  let lastRes: Response | null = null;
+  let lastRes: any = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     if (attempt > 0) {
@@ -78,53 +64,72 @@ async function ipRoyalFetch(url: string, options: RequestInit): Promise<Response
     }
 
     try {
-      const agent = makeIPRoyalAgent();
+      // Create fresh ProxyAgent per request (ensures IP rotation)
+      const dispatcher = new ProxyAgent(proxyUri);
 
-      // FIX: Cast to (any) to pass agent — TypeScript's RequestInit doesn't
-      // include agent but Node.js fetch supports it at runtime
-      const res = await (fetch as any)(url, {
-        ...options,
-        agent,
-        cache: "no-store",
+      // Extract headers from RequestInit
+      const reqHeaders: Record<string, string> = {};
+      if (options.headers) {
+        const h = options.headers as Record<string, string>;
+        Object.keys(h).forEach((k) => { reqHeaders[k] = h[k]; });
+      }
+
+      // Use undici fetch with dispatcher — THIS IS THE CORRECT IPROYAL METHOD
+      const res = await undiciFetch(url, {
+        method:     (options.method || "GET") as any,
+        headers:    reqHeaders,
+        body:       options.body as any,
+        redirect:   "follow",
+        dispatcher, // ← This is how IPRoyal works
       });
 
-      // 407 = wrong credentials or IP not whitelisted in IPRoyal dashboard
+      // 407 = wrong credentials or IP not whitelisted
       if (res.status === 407) {
         console.error("[iproyal] 407 Proxy Auth Failed — check credentials or whitelist VPS IP in IPRoyal dashboard");
-        return res;
+        // Convert undici response to standard Response
+        const body = await res.text();
+        return new Response(body, { status: 407, headers: Object.fromEntries(res.headers) });
       }
 
       if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
-        console.log(`[iproyal] Got ${res.status} — retrying with fresh connection...`);
+        console.log(`[iproyal] Got ${res.status} — retrying...`);
         lastRes = res;
         continue;
       }
 
-      return res;
+      // Convert undici response to standard Web API Response
+      const responseBody = await res.arrayBuffer();
+      const responseHeaders = new Headers();
+      res.headers.forEach((value: string, key: string) => {
+        responseHeaders.set(key, value);
+      });
+
+      return new Response(responseBody, {
+        status:  res.status,
+        headers: responseHeaders,
+      });
+
     } catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
-      const msg = lastErr.message;
-
-      if (msg.includes("TUNNEL") || msg.includes("tunneling")) {
-        console.error("[iproyal] Tunnel failed — verify IPROYAL_HOST/PORT and whitelist VPS IP in dashboard");
-      }
-      console.warn(`[iproyal] Attempt ${attempt + 1} error: ${msg}`);
+      console.warn(`[iproyal] Attempt ${attempt + 1} error: ${lastErr.message}`);
     }
   }
 
-  if (lastRes) return lastRes;
+  if (lastRes) {
+    const body = await lastRes.arrayBuffer();
+    const headers = new Headers();
+    lastRes.headers.forEach((v: string, k: string) => headers.set(k, v));
+    return new Response(body, { status: lastRes.status, headers });
+  }
+
   throw lastErr ?? new Error("IPRoyal: all retries failed");
 }
 
-// ── Tor ────────────────────────────────────────────────────────────────────────
+// ── Tor fetch ──────────────────────────────────────────────────────────────────
 
 const TOR_HOST         = "127.0.0.1";
 const TOR_SOCKS_PORT   = 9050;
 const TOR_CONTROL_PORT = 9051;
-
-function makeTorAgent(): SocksProxyAgent {
-  return new SocksProxyAgent(`socks5://${TOR_HOST}:${TOR_SOCKS_PORT}`, { timeout: 20000 });
-}
 
 async function rotateTorCircuit(): Promise<void> {
   return new Promise((resolve) => {
@@ -147,8 +152,8 @@ async function rotateTorCircuit(): Promise<void> {
 }
 
 async function torFetch(url: string, options: RequestInit): Promise<Response> {
+  const { SocksProxyAgent } = await import("socks-proxy-agent");
   let lastErr: Error | null = null;
-  let lastRes: Response | null = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     if (attempt > 0) {
@@ -156,44 +161,30 @@ async function torFetch(url: string, options: RequestInit): Promise<Response> {
       await sleep(RETRY_DELAY_MS * attempt);
     }
     try {
-      // FIX: Cast to (any) to pass agent
-      const res = await (fetch as any)(url, {
-        ...options,
-        agent: makeTorAgent(),
-        cache: "no-store",
-      });
-      if (BLOCKED_CODES.has(res.status) && attempt < MAX_RETRIES - 1) {
-        lastRes = res;
-        continue;
-      }
-      return res;
+      const agent = new SocksProxyAgent(`socks5://${TOR_HOST}:${TOR_SOCKS_PORT}`);
+      return await (fetch as any)(url, { ...options, agent, cache: "no-store" });
     } catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
       console.warn(`[tor] Attempt ${attempt + 1} failed: ${lastErr.message}`);
     }
   }
-
-  if (lastRes) return lastRes;
   throw lastErr ?? new Error("Tor: all retries failed");
 }
 
-// ── Direct ─────────────────────────────────────────────────────────────────────
+// ── Direct fetch ───────────────────────────────────────────────────────────────
 
 async function directFetch(url: string, options: RequestInit): Promise<Response> {
   let lastErr: Error | null = null;
   for (let i = 0; i < 2; i++) {
     if (i > 0) await sleep(RETRY_DELAY_MS);
-    try {
-      return await fetch(url, options);
-    } catch (e) {
+    try { return await fetch(url, options); }
+    catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
       if (lastErr.name === "AbortError") throw lastErr;
     }
   }
   throw lastErr ?? new Error("Fetch failed");
 }
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
