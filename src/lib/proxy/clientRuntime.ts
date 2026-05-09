@@ -154,9 +154,8 @@ export function buildClientRuntimePatch(
       if (_proxyHost && xh === _proxyHost && isInternalPath(x)) return x.href;
       if (_subdomainMode && xh === _rootDomain && isInternalPath(x)) return x.href;
 
-      // FIX: URL resolves to our proxy domain but without double-dash encoding.
-      // e.g. "collector.daddyproxy.com" was built by site code appending ".proxyhost"
-      // to a subdomain. Decode the prefix to reconstruct the real target URL.
+      // FIX: URL resolves to our proxy domain without double-dash encoding.
+      // Decode the prefix to reconstruct the real target URL.
       if (_rootDomain && xh.endsWith("." + _rootDomain) && !isAlreadyProxied(x.href)) {
         var _rawPfx = xh.slice(0, xh.length - (_rootDomain.length + 1));
         var _decodedPrefix = _rawPfx.replace(/--/g, ".");
@@ -165,7 +164,6 @@ export function buildClientRuntimePatch(
           if (_decodedPrefix === _targetHost) {
             _corrected = _targetOrigin + x.pathname + x.search + x.hash;
           } else if (_decodedPrefix.indexOf(".") === -1) {
-            // Single-word prefix (e.g. "collector") → subdomain of target
             _corrected = x.protocol + "//" + _decodedPrefix + "." + _targetHost + x.pathname + x.search + x.hash;
           } else {
             _corrected = x.protocol + "//" + _decodedPrefix + x.pathname + x.search + x.hash;
@@ -372,7 +370,7 @@ export function buildClientRuntimePatch(
   try { window.__bwProxy = p; } catch (e) {}
 
 
-  // ─── 15. Prototype-level src/href patching ────────────────────────────────
+  // --- 15. Prototype-level src/href patching ----------------------------------
   (function () {
     function patchProtoProp(ctor, propName) {
       if (!ctor || !ctor.prototype) return;
@@ -402,7 +400,7 @@ export function buildClientRuntimePatch(
     try { patchProtoProp(HTMLAnchorElement,  "href"); } catch (e) {}
   })();
 
-  // ─── 16. MutationObserver — catch innerHTML/insertAdjacentHTML iframes ─────
+  // --- 16. MutationObserver: catch innerHTML/insertAdjacentHTML iframes -------
   (function () {
     function rewriteAddedNode(node) {
       if (!node || node.nodeType !== 1) return;
@@ -440,7 +438,7 @@ export function buildClientRuntimePatch(
     } catch (e) {}
   })();
 
-  // ─── 17. document.createElementNS patch ──────────────────────────────────
+  // --- 17. document.createElementNS patch -------------------------------------
   var _origCreateNS = document.createElementNS;
   if (_origCreateNS) {
     document.createElementNS = function (ns, tag) {
@@ -456,10 +454,10 @@ export function buildClientRuntimePatch(
     };
   }
 
-  // ─── 18. window.Request constructor patch ─────────────────────────────────
-  // TikTok/Twitter interceptors extract request.url from the Request object
-  // BEFORE calling native fetch. Patching the constructor ensures the URL
-  // stored inside the Request is already proxied when any interceptor reads it.
+  // --- 18. window.Request constructor patch -----------------------------------
+  // Interceptors (TikTok, Twitter) extract request.url from the Request object
+  // before calling native fetch. Patching the constructor ensures the URL
+  // stored in Request is already proxied when any interceptor reads it.
   var _origRequestCtor = window.Request;
   if (_origRequestCtor) {
     var _BwRequest = function (resource, init) {
@@ -475,8 +473,8 @@ export function buildClientRuntimePatch(
     } catch (e) {}
   }
 
-  // ─── 19. Lock window.fetch via Object.defineProperty ──────────────────────
-  // Any later `window.fetch = wrapper` goes through our setter, which wraps
+  // --- 19. Lock window.fetch via Object.defineProperty ------------------------
+  // Any later window.fetch assignment goes through our setter, which wraps
   // the replacement with URL rewriting. Module-local references captured AFTER
   // our script therefore always include the rewriting layer.
   (function () {

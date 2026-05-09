@@ -66,13 +66,10 @@ export async function GET(request: NextRequest) {
     if (accept.includes("text/html")) {
       return applyCors(
         new NextResponse(
-          `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<title>Blockway – Missing URL</title>
-<style>body{font-family:system-ui,sans-serif;max-width:500px;margin:4rem auto;padding:0 1rem}</style>
-</head><body>
-<h1>Blockway Proxy</h1>
-<p>Provide a target URL: <code>/proxy?url=https://example.com</code></p>
-</body></html>`,
+          "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+          "<title>Blockway</title></head><body style=\"font-family:sans-serif;padding:2rem\">" +
+          "<h1>Blockway Proxy</h1><p>Usage: <code>/proxy?url=https://example.com</code></p>" +
+          "</body></html>",
           { status: 400, headers: { "content-type": "text/html; charset=utf-8" } },
         ),
       );
